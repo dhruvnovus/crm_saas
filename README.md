@@ -85,10 +85,40 @@ python manage.py migrate
 python manage.py createsuperuser
 ```
 
-### 8. Optional: Setup Tenant Template
+### 8. Tenant Setup (per-tenant DB)
 ```bash
-python manage.py setup_tenant_template
-python manage.py create_token_table
+# Create initial migrations for local model changes (main DB)
+python manage.py makemigrations
+python manage.py migrate
+
+# Create the token table for a tenant (if missing)
+python manage.py create_token_table <TENANT_NAME>
+
+# If a tenant DB needs structure setup/fix (tables, FKs, columns)
+# All tenants
+python manage.py setup_tenant_tables --all-tenants
+# Or by tenant id
+python manage.py setup_tenant_tables --tenant-id <TENANT_ID>
+# Or by database name
+python manage.py setup_tenant_tables --database-name crm_tenant_<tenant>
+# Fix foreign keys/columns across all tenants
+python manage.py setup_tenant_tables --fix-foreign-keys
+
+# Run full migrations for a specific tenant (creates DB if needed)
+python manage.py migrate_tenant <TENANT_NAME> --create
+
+# Apply only leads app migrations to one or all tenants
+python manage.py migrate_leads --tenant-name <TENANT_NAME>
+python manage.py migrate_leads --all-tenants
+# Optionally generate app migrations before applying to tenants
+python manage.py migrate_leads --all-tenants --makemigrations
+
+# Migrate auth token tables inside a tenant DB
+python manage.py migrate_authtoken_to_tenant <TENANT_NAME>
+
+# If authentication tables are missing/broken in one or all tenants
+python manage.py fix_tenant_auth <TENANT_NAME>
+python manage.py fix_tenant_auth <TENANT_NAME> --all
 ```
 
 ### 9. Start Development Server
@@ -181,23 +211,37 @@ curl -X POST http://localhost:8000/api/auth/tenant/users/create/ \
 The project includes several custom management commands for tenant management:
 
 ```bash
-# Setup tenant template database
-python manage.py setup_tenant_template
+# Create Token table in a specific tenant DB
+python manage.py create_token_table <TENANT_NAME>
 
-# Create token table
-python manage.py create_token_table
+# Run migrations for a specific tenant (will connect and migrate that DB)
+python manage.py migrate_tenant <TENANT_NAME> [--create]
 
-# Migrate users to tenant
-python manage.py migrate_user_to_tenant
+# Apply only leads app migrations
+python manage.py migrate_leads --tenant-name <TENANT_NAME>
+python manage.py migrate_leads --all-tenants [--makemigrations]
 
-# Copy user to tenant
-python manage.py copy_user_to_tenant
+# Ensure tenant DB has all required tables and safe FK/columns
+python manage.py setup_tenant_tables --all-tenants
+python manage.py setup_tenant_tables --tenant-id <TENANT_ID>
+python manage.py setup_tenant_tables --database-name crm_tenant_<tenant>
+python manage.py setup_tenant_tables --fix-foreign-keys
 
-# Setup tenant tables
-python manage.py setup_tenant_tables
+# Migrate Django authtoken tables to tenant DB
+python manage.py migrate_authtoken_to_tenant <TENANT_NAME>
 
-# Recreate tenant database
-python manage.py recreate_tenant_db
+# Fix missing/broken auth tables inside tenant DB(s)
+python manage.py fix_tenant_auth <TENANT_NAME>
+python manage.py fix_tenant_auth <TENANT_NAME> --all
+
+# Migrate existing users into tenant DB (data copy)
+python manage.py migrate_users_to_tenant <TENANT_NAME>
+
+# Copy a single user into tenant DB (testing)
+python manage.py copy_user_to_tenant <USERNAME> <TENANT_NAME>
+
+# Recreate a tenant database from scratch (DANGER: drops DB)
+python manage.py recreate_tenant_db <TENANT_NAME>
 ```
 
 ## 🏢 Multi-Tenancy Implementation

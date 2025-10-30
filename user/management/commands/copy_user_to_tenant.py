@@ -70,7 +70,7 @@ class Command(BaseCommand):
                 user.is_staff,
                 user.is_active,
                 user.date_joined,
-                str(tenant.id),
+                tenant.id.hex,
                 user.is_tenant_admin
             ))
             
@@ -85,7 +85,7 @@ class Command(BaseCommand):
             
             cursor.execute(insert_tenant_user, (
                 user.id,
-                str(tenant.id),
+                tenant.id.hex,
                 now,
                 now
             ))

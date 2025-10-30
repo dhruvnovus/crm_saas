@@ -16,8 +16,9 @@ urlpatterns = [
     
     # Tenant management
     path('tenants/', views.TenantListCreateView.as_view(), name='tenant_list'),
-    path('tenant/users/', views.tenant_users, name='tenant_users'),
-    path('tenant/users/create/', views.create_tenant_user, name='create_tenant_user'),
+    path('tenants/<uuid:pk>/', views.TenantDetailView.as_view(), name='tenant_detail'),
+    # path('tenant/users/', views.tenant_users, name='tenant_users'),
+    # path('tenant/users/create/', views.create_tenant_user, name='create_tenant_user'),
     
     # History endpoints
     path('history/', views.HistoryListView.as_view(), name='history_list'),

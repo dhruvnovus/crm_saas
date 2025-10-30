@@ -78,6 +78,13 @@ class UserLoginSerializer(serializers.Serializer):
         tenant_name = attrs.get('tenant')
         
         if username and password:
+            # Allow login with email by converting to username if needed
+            if '@' in username:
+                try:
+                    user_by_email = CustomUser.objects.get(email=username)
+                    username = user_by_email.username
+                except CustomUser.DoesNotExist:
+                    pass
             # First try to authenticate against main database (for tenant admins)
             user = authenticate(username=username, password=password)
             
@@ -127,6 +134,21 @@ class UserLoginSerializer(serializers.Serializer):
                     pass
             
             if not user:
+                # Final fallback: direct password check in main DB
+                try:
+                    candidate = CustomUser.objects.get(username=username)
+                    if candidate.check_password(password):
+                        user = candidate
+                except CustomUser.DoesNotExist:
+                    # Try resolve by email as a last resort
+                    try:
+                        candidate = CustomUser.objects.get(email=username)
+                        if candidate.check_password(password):
+                            user = candidate
+                    except CustomUser.DoesNotExist:
+                        pass
+            
+            if not user:
                 if tenant_name:
                     raise serializers.ValidationError(f'Invalid credentials for user "{username}" in tenant "{tenant_name}"')
                 else:
@@ -146,7 +168,7 @@ class UserSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = CustomUser
-        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'tenant', 'is_tenant_admin', 'date_joined']
+        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'tenant', 'is_tenant_admin', 'is_superuser', 'date_joined']
         read_only_fields = ['id', 'date_joined']
 
 
@@ -197,14 +219,17 @@ class CreateTenantUserSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         """Create user with tenant context"""
         tenant = self.context['tenant']
-        # Always create user in main database (simplified approach)
-        # TODO: Implement proper tenant database user management
+        from django.db import connections
+        # Ensure ORM targets the tenant database for this request
+        connections['default'].tenant = tenant
+        
+        # Create the user inside the tenant database
         user = CustomUser.objects.create_user(
             tenant=tenant,
             **validated_data
         )
         
-        # Create tenant user relationship in main database
-        TenantUser.objects.create(user=user, tenant=tenant)
+        # Create tenant-user mapping in the tenant database as well
+        TenantUser.objects.get_or_create(user=user, tenant=tenant)
         
         return user

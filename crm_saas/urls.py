@@ -34,12 +34,16 @@ schema_view = get_schema_view(
     permission_classes=[permissions.AllowAny],
     patterns=[
         path('api/auth/', include('user.urls')),
+        path('api/customers/', include('customer.urls')),
+        path('api/leads/', include('leads.urls')),
     ],
 )
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/auth/', include('user.urls')),
+    path('api/customers/', include('customer.urls')),
+    path('api/leads/', include('leads.urls')),
     
     # API schema endpoint
     path('api/schema/', schema_view.without_ui(cache_timeout=0), name='schema-json'),

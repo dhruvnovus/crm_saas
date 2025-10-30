@@ -48,9 +48,8 @@ class TenantDatabaseRouter:
         if hasattr(model, '_meta'):
             # Handle user app models
             if model._meta.app_label == 'user':
-                # Only tenant metadata and history use main database
-                if model._meta.model_name in ['tenant', 'history']:
-                    # For tenant management and history, use main database
+                # History and Tenant stay in main database
+                if model._meta.model_name in ['history', 'tenant']:
                     return 'default'
                 # For users and tenant-user relationships, use the tenant database
                 tenant = getattr(connection, 'tenant', None)
@@ -59,6 +58,20 @@ class TenantDatabaseRouter:
                 # If no tenant context, use default database
                 return 'default'
             
+            # Handle customer app models
+            if model._meta.app_label == 'customer':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
+            # Handle leads app models
+            if model._meta.app_label == 'leads':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
             # Handle authtoken app models (Token model)
             elif model._meta.app_label == 'authtoken':
                 tenant = getattr(connection, 'tenant', None)
@@ -73,9 +86,8 @@ class TenantDatabaseRouter:
         if hasattr(model, '_meta'):
             # Handle user app models
             if model._meta.app_label == 'user':
-                # Only tenant metadata and history use main database
-                if model._meta.model_name in ['tenant', 'history']:
-                    # For tenant management and history, use main database
+                # History and Tenant stay in main database
+                if model._meta.model_name in ['history', 'tenant']:
                     return 'default'
                 # For users and tenant-user relationships, use the tenant database
                 tenant = getattr(connection, 'tenant', None)
@@ -84,6 +96,20 @@ class TenantDatabaseRouter:
                 # If no tenant context, use default database
                 return 'default'
             
+            # Handle customer app models
+            if model._meta.app_label == 'customer':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
+            # Handle leads app models
+            if model._meta.app_label == 'leads':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
             # Handle authtoken app models (Token model)
             elif model._meta.app_label == 'authtoken':
                 tenant = getattr(connection, 'tenant', None)
@@ -106,6 +132,13 @@ class TenantDatabaseRouter:
             # For users and tenant-user relationships, use tenant databases
             return db != 'default'
         elif app_label == 'authtoken':
-            # Token model should migrate to tenant databases when tenant context exists
+            # Ensure Token model exists in both default and tenant databases
+            # so superusers (default DB) and tenant users can authenticate
+            return True
+        elif app_label == 'customer':
+            # Customer tables should live only in tenant databases
+            return db != 'default'
+        elif app_label == 'leads':
+            # Lead tables should live only in tenant databases
             return db != 'default'
         return db == 'default'

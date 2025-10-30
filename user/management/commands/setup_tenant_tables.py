@@ -125,7 +125,7 @@ class Command(BaseCommand):
                     'auth_group_permissions', 'django_migrations', 'django_session',
                     'django_admin_log', 'user_customuser', 'user_tenantuser', 
                     'user_history', 'auth_user_groups', 'auth_user_user_permissions', 
-                    'authtoken_token'
+                    'authtoken_token', 'customer_customer', 'leads_lead'
                 ]
                 missing_tables = [table for table in required_tables if table not in existing_tables]
                 if not missing_tables:
@@ -172,7 +172,9 @@ class Command(BaseCommand):
                 'user_history',
                 'auth_user_groups',
                 'auth_user_user_permissions',
-                'authtoken_token'
+                'authtoken_token',
+                'customer_customer',
+                'leads_lead'
             ]
             
             # Create each required table
@@ -197,8 +199,10 @@ class Command(BaseCommand):
             # Create missing Django built-in tables
             self.create_django_builtin_tables(cursor)
             
-            # Always fix user tables to remove tenant foreign key constraints
+            # Always fix user/customer tables to remove tenant foreign key constraints
             self.fix_user_customuser_table(cursor)
+            # Ensure customer new columns exist
+            self.ensure_customer_columns(cursor)
             
             # Re-enable foreign key checks
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
@@ -244,7 +248,7 @@ class Command(BaseCommand):
                 'auth_group_permissions', 'django_migrations', 'django_session',
                 'django_admin_log', 'user_customuser', 'user_tenantuser', 
                 'user_history', 'auth_user_groups', 'auth_user_user_permissions', 
-                'authtoken_token'
+                'authtoken_token', 'customer_customer', 'leads_lead'
             ]
             
             missing_tables = [table for table in required_tables if table not in tables]
@@ -314,38 +318,98 @@ class Command(BaseCommand):
         self.stdout.write('Created table: auth_user_user_permissions')
 
     def fix_user_customuser_table(self, cursor):
-        """Fix user_customuser and user_tenantuser tables to remove tenant foreign key constraints"""
+        """Fix user_customuser, user_tenantuser and customer_customer tables to remove tenant foreign key constraints"""
         try:
+            # Helper to drop all FKs on a column regardless of generated name
+            def drop_foreign_keys(table_name, column_name):
+                cursor.execute("""
+                    SELECT CONSTRAINT_NAME
+                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                      AND COLUMN_NAME = %s
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+                """, (table_name, column_name))
+                constraints = [row[0] for row in cursor.fetchall()]
+                for constraint in constraints:
+                    self.stdout.write(f"Dropping foreign key {constraint} on {table_name}.{column_name}")
+                    cursor.execute(f"ALTER TABLE `{table_name}` DROP FOREIGN KEY `{constraint}`")
+
             # Fix user_customuser table
             cursor.execute("SHOW TABLES LIKE 'user_customuser'")
             if cursor.fetchone():
-                cursor.execute("SHOW CREATE TABLE user_customuser")
-                create_statement = cursor.fetchone()[1]
-                
-                if 'CONSTRAINT `user_customuser_ibfk_1`' in create_statement:
-                    self.stdout.write('Fixing user_customuser table - removing tenant foreign key constraint')
-                    cursor.execute("ALTER TABLE user_customuser DROP FOREIGN KEY user_customuser_ibfk_1")
+                drop_foreign_keys('user_customuser', 'tenant_id')
+                # relax the column type to nullable in case it was NOT NULL with FK
+                try:
                     cursor.execute("ALTER TABLE user_customuser MODIFY COLUMN tenant_id char(32) NULL")
-                    self.stdout.write('Fixed user_customuser table')
-                else:
-                    self.stdout.write('user_customuser table is already fixed')
-            
+                except Exception:
+                    pass
+                self.stdout.write('Checked and fixed FKs for user_customuser')
+
             # Fix user_tenantuser table
             cursor.execute("SHOW TABLES LIKE 'user_tenantuser'")
             if cursor.fetchone():
-                cursor.execute("SHOW CREATE TABLE user_tenantuser")
-                create_statement = cursor.fetchone()[1]
-                
-                if 'CONSTRAINT `user_tenantuser_ibfk_1`' in create_statement:
-                    self.stdout.write('Fixing user_tenantuser table - removing tenant foreign key constraint')
-                    cursor.execute("ALTER TABLE user_tenantuser DROP FOREIGN KEY user_tenantuser_ibfk_1")
+                drop_foreign_keys('user_tenantuser', 'tenant_id')
+                try:
                     cursor.execute("ALTER TABLE user_tenantuser MODIFY COLUMN tenant_id char(32) NULL")
-                    self.stdout.write('Fixed user_tenantuser table')
-                else:
-                    self.stdout.write('user_tenantuser table is already fixed')
+                except Exception:
+                    pass
+                self.stdout.write('Checked and fixed FKs for user_tenantuser')
+
+            # Fix customer_customer table
+            cursor.execute("SHOW TABLES LIKE 'customer_customer'")
+            if cursor.fetchone():
+                drop_foreign_keys('customer_customer', 'tenant_id')
+                drop_foreign_keys('customer_customer', 'created_by_id')
+                try:
+                    cursor.execute("ALTER TABLE customer_customer MODIFY COLUMN tenant_id char(32) NULL")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("ALTER TABLE customer_customer MODIFY COLUMN created_by_id bigint NULL")
+                except Exception:
+                    pass
+                self.stdout.write('Checked and fixed FKs for customer_customer')
                 
         except Exception as e:
             self.stdout.write(f'Warning: Could not fix user tables: {str(e)}')
+
+    def fix_leads_table(self, cursor):
+        """Fix leads_lead table FK constraints if present in tenant DB"""
+        try:
+            def drop_foreign_keys(table_name, column_name):
+                cursor.execute("""
+                    SELECT CONSTRAINT_NAME
+                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                      AND COLUMN_NAME = %s
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+                """, (table_name, column_name))
+                constraints = [row[0] for row in cursor.fetchall()]
+                for constraint in constraints:
+                    self.stdout.write(f"Dropping foreign key {constraint} on {table_name}.{column_name}")
+                    cursor.execute(f"ALTER TABLE `{table_name}` DROP FOREIGN KEY `{constraint}`")
+
+            cursor.execute("SHOW TABLES LIKE 'leads_lead'")
+            if cursor.fetchone():
+                for col in ['tenant_id', 'created_by_id', 'customer_id']:
+                    drop_foreign_keys('leads_lead', col)
+                try:
+                    cursor.execute("ALTER TABLE leads_lead MODIFY COLUMN tenant_id char(32) NULL")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("ALTER TABLE leads_lead MODIFY COLUMN created_by_id bigint NULL")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("ALTER TABLE leads_lead MODIFY COLUMN customer_id char(32) NULL")
+                except Exception:
+                    pass
+                self.stdout.write('Checked and fixed FKs for leads_lead')
+        except Exception as e:
+            self.stdout.write(f'Warning: Could not fix leads_lead table: {str(e)}')
 
     def fix_all_tenant_foreign_keys(self):
         """Fix foreign key constraints in all tenant databases"""
@@ -385,8 +449,10 @@ class Command(BaseCommand):
             cursor.execute("DROP TABLE IF EXISTS user_tenant")
             self.stdout.write(f'Dropped user_tenant table from {database_name}')
             
-            # Fix user tables
+            # Fix user, customer, and leads tables
             self.fix_user_customuser_table(cursor)
+            self.ensure_customer_columns(cursor)
+            self.fix_leads_table(cursor)
             
             # Re-enable foreign key checks
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
@@ -422,3 +488,33 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(f'Error checking database existence: {str(e)}')
             return False
+
+    def ensure_customer_columns(self, cursor):
+        """Add missing columns for customer_customer introduced recently"""
+        try:
+            cursor.execute("SHOW TABLES LIKE 'customer_customer'")
+            if not cursor.fetchone():
+                return
+            desired_columns = [
+                ('address', "TEXT NULL"),
+                ('city', "VARCHAR(120) NULL"),
+                ('state', "VARCHAR(120) NULL"),
+                ('country', "VARCHAR(120) NULL"),
+                ('zip_code', "VARCHAR(20) NULL"),
+                ('is_active', "TINYINT(1) NOT NULL DEFAULT 1"),
+            ]
+            for col_name, col_def in desired_columns:
+                cursor.execute(
+                    """
+                    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'customer_customer'
+                      AND COLUMN_NAME = %s
+                    """,
+                    (col_name,)
+                )
+                if not cursor.fetchone():
+                    self.stdout.write(f"Adding column {col_name} to customer_customer")
+                    cursor.execute(f"ALTER TABLE customer_customer ADD COLUMN {col_name} {col_def}")
+        except Exception as e:
+            self.stdout.write(f'Warning: Could not ensure customer columns: {str(e)}')

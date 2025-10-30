@@ -43,6 +43,8 @@ INSTALLED_APPS = [
     'drf_yasg',
     'django_filters',
     'user',
+    'customer',
+    'leads',
 ]
 
 MIDDLEWARE = [
@@ -97,8 +99,7 @@ DATABASES = {
 }
 
 # Database routing for multi-tenancy
-# Temporarily disabled to fix tenant user creation issues
-# DATABASE_ROUTERS = ['user.routers.TenantDatabaseRouter']
+DATABASE_ROUTERS = ['user.routers.TenantDatabaseRouter']
 
 
 # Password validation

@@ -7,6 +7,8 @@ from django.contrib.auth import authenticate
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
+from django.utils.decorators import method_decorator
+from .permissions import IsTenantAdminOrSuperuser, IsSuperuserOnly
 from django.utils import timezone
 from django.db import models
 from datetime import datetime, timedelta
@@ -22,6 +24,7 @@ from .serializers import (
 )
 
 
+@swagger_auto_schema(method='get', tags=['Authentication'])
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def test_endpoint(request):
@@ -138,11 +141,22 @@ def login(request):
     serializer = UserLoginSerializer(data=login_data)
     if serializer.is_valid():
         user = serializer.validated_data['user']
-        
-        # Handle token creation - for now, always use main database
-        # TODO: Implement proper tenant database user management
+
+        # Ensure token is created in the same database where the user record lives
         try:
-            # Always create token in main database for now
+            from django.db import connections
+            # Determine which DB the user instance originates from
+            user_db_alias = getattr(getattr(user, '_state', None), 'db', 'default')
+
+            if getattr(user, 'is_superuser', False) or user_db_alias == 'default':
+                # Superusers and users stored in main DB: create token in main DB
+                connections['default'].tenant = None
+            elif hasattr(user, 'tenant') and user.tenant:
+                # Users stored in tenant DB: route to tenant DB
+                connections['default'].tenant = user.tenant
+            else:
+                connections['default'].tenant = None
+
             token, created = Token.objects.get_or_create(user=user)
         except Exception as e:
             # Log the error for debugging
@@ -159,6 +173,12 @@ def login(request):
                 return Response({
                     'error': 'Authentication failed. Please try again.'
                 }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        finally:
+            # Always clear tenant context after token creation to avoid leaking it to other requests
+            try:
+                connections['default'].tenant = None
+            except Exception:
+                pass
         
         return Response({
             'user': UserSerializer(user).data,
@@ -220,7 +240,7 @@ def logout(request):
         ),
         401: openapi.Response(description="Authentication required")
     },
-    tags=['User Profile']
+    tags=['Tenant Management']
 )
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -230,6 +250,11 @@ def user_profile(request):
     return Response(serializer.data)
 
 
+@swagger_auto_schema(
+    method='put',
+    operation_description="Update user profile",
+    tags=['Tenant Management']
+)
 @api_view(['PUT'])
 @permission_classes([IsAuthenticated])
 def update_profile(request):
@@ -241,11 +266,13 @@ def update_profile(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+@method_decorator(name='get', decorator=swagger_auto_schema(tags=['Tenant Management']))
+@method_decorator(name='post', decorator=swagger_auto_schema(tags=['Tenant Management']))
 class TenantListCreateView(generics.ListCreateAPIView):
     """List and create tenants (admin only)"""
     queryset = Tenant.objects.all()
     serializer_class = TenantSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsSuperuserOnly]
     
     def get_queryset(self):
         # Only show tenants for the current user
@@ -254,72 +281,94 @@ class TenantListCreateView(generics.ListCreateAPIView):
         return Tenant.objects.filter(tenantuser__user=self.request.user)
 
 
+@method_decorator(name='get', decorator=swagger_auto_schema(tags=['Tenant Management']))
+@method_decorator(name='delete', decorator=swagger_auto_schema(tags=['Tenant Management']))
+class TenantDetailView(generics.RetrieveDestroyAPIView):
+    """Retrieve or soft-delete a tenant"""
+    queryset = Tenant.objects.all()
+    serializer_class = TenantSerializer
+    permission_classes = [IsAuthenticated, IsSuperuserOnly]
+    lookup_field = 'pk'
+
+    def delete(self, request, *args, **kwargs):
+        tenant = self.get_object()
+        # Only superuser or tenant admin associated with this tenant can delete
+        if not (request.user.is_superuser or (request.user.tenant == tenant and request.user.is_tenant_admin)):
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        tenant.is_active = False
+        tenant.save(update_fields=['is_active', 'updated_at'])
+        return Response({'message': 'Tenant soft-deleted'}, status=status.HTTP_200_OK)
+
+
+@swagger_auto_schema(method='get', exclude=True)
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsSuperuserOnly])
 def tenant_users(request):
     """Get users for current tenant"""
-    if not request.user.tenant:
-        return Response({'error': 'No tenant associated'}, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Set tenant context for database routing
     from django.db import connections
-    connections['default'].tenant = request.user.tenant
-    
-    # Query users from tenant database
-    tenant_users = CustomUser.objects.all()
-    serializer = UserSerializer(tenant_users, many=True)
-    return Response(serializer.data)
+    try:
+        # Determine tenant: prefer explicit header/query for superuser, fallback to user's tenant
+        tenant_obj = None
+        if request.user.tenant:
+            tenant_obj = request.user.tenant
+        else:
+            # Allow superusers to specify tenant via header or query
+            tenant_name = request.META.get('HTTP_X_TENANT') or request.GET.get('tenant')
+            if tenant_name:
+                try:
+                    tenant_obj = Tenant.objects.get(name=tenant_name, is_active=True)
+                except Tenant.DoesNotExist:
+                    return Response({'error': 'Tenant not found or inactive'}, status=status.HTTP_400_BAD_REQUEST)
+        if not tenant_obj:
+            return Response({'error': 'No tenant associated or provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Set tenant context for database routing
+        connections['default'].tenant = tenant_obj
+
+        # Query users from tenant database
+        tenant_users_qs = CustomUser.objects.all()
+        serializer = UserSerializer(tenant_users_qs, many=True)
+        return Response(serializer.data)
+    finally:
+        # Clear tenant context
+        try:
+            connections['default'].tenant = None
+        except Exception:
+            pass
 
 
-@swagger_auto_schema(
-    method='post',
-    operation_description="Create a new user within the current tenant",
-    request_body=CreateTenantUserSerializer,
-    responses={
-        201: openapi.Response(
-            description="User created successfully",
-            examples={
-                "application/json": {
-                    "id": 4,
-                    "username": "newuser",
-                    "email": "newuser@example.com",
-                    "first_name": "New",
-                    "last_name": "User",
-                    "tenant": {
-                        "id": "uuid-here",
-                        "name": "TestTenant"
-                    },
-                    "is_tenant_admin": False,
-                    "date_joined": "2024-01-01T00:00:00Z"
-                }
-            }
-        ),
-        400: openapi.Response(description="Bad request - validation errors"),
-        403: openapi.Response(description="Permission denied")
-    },
-    tags=['Tenant Management']
-)
+@swagger_auto_schema(method='post', exclude=True)
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsSuperuserOnly])
 def create_tenant_user(request):
     """Create a new user within the current tenant"""
     if not request.user.tenant or not request.user.is_tenant_admin:
         return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
     
-    # Create user in main database (simplified approach)
-    # TODO: Implement proper tenant database user management
-    serializer = CreateTenantUserSerializer(
-        data=request.data, 
-        context={'tenant': request.user.tenant}
-    )
-    
-    if serializer.is_valid():
-        user = serializer.save()
-        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
-    
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    # Ensure all subsequent ORM operations target the logged-in tenant database
+    from django.db import connections
+    try:
+        connections['default'].tenant = request.user.tenant
+
+        serializer = CreateTenantUserSerializer(
+            data=request.data, 
+            context={'tenant': request.user.tenant}
+        )
+        
+        if serializer.is_valid():
+            user = serializer.save()
+            return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    finally:
+        # Clear tenant context
+        try:
+            connections['default'].tenant = None
+        except Exception:
+            pass
 
 
+@method_decorator(name='get', decorator=swagger_auto_schema(tags=['History']))
 class HistoryListView(generics.ListAPIView):
     """List all API history records with filtering and pagination"""
     serializer_class = HistoryListSerializer

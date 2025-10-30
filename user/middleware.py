@@ -19,27 +19,33 @@ class TenantMiddleware:
     def __call__(self, request):
         # Extract tenant from request (could be from subdomain, header, etc.)
         tenant_name = self.get_tenant_from_request(request)
-        
-        if tenant_name:
-            try:
-                tenant = Tenant.objects.get(name=tenant_name, is_active=True)
-                # Set tenant in connection for database routing
-                connections['default'].tenant = tenant
-                request.tenant = tenant
-            except Tenant.DoesNotExist:
+        try:
+            if tenant_name:
+                try:
+                    tenant = Tenant.objects.get(name=tenant_name, is_active=True)
+                    # Set tenant in connection for database routing
+                    connections['default'].tenant = tenant
+                    request.tenant = tenant
+                except Tenant.DoesNotExist:
+                    request.tenant = None
+            else:
                 request.tenant = None
-        else:
-            request.tenant = None
-        
-        response = self.get_response(request)
-        
-        # After authentication, try to get tenant from user if not already set
-        if hasattr(request, 'user') and request.user.is_authenticated and not request.tenant:
-            if hasattr(request.user, 'tenant') and request.user.tenant:
-                request.tenant = request.user.tenant
-                connections['default'].tenant = request.user.tenant
-        
-        return response
+            
+            response = self.get_response(request)
+            
+            # After authentication, try to get tenant from user if not already set
+            if hasattr(request, 'user') and request.user.is_authenticated and not request.tenant:
+                if hasattr(request.user, 'tenant') and request.user.tenant:
+                    request.tenant = request.user.tenant
+                    connections['default'].tenant = request.user.tenant
+            
+            return response
+        finally:
+            # Always clear tenant context to prevent leakage between requests
+            try:
+                connections['default'].tenant = None
+            except Exception:
+                pass
     
     def get_tenant_from_request(self, request):
         """Extract tenant name from request"""
@@ -95,7 +101,7 @@ class HistoryMiddleware(MiddlewareMixin):
                 return False
         
         # Only log API requests (typically starting with /api/)
-        return path.startswith('/api/') or path.startswith('/user/')
+        return path.startswith('/api/')
     
     def _log_request(self, request, response):
         """Log the request details to History model"""
