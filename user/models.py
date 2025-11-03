@@ -98,3 +98,22 @@ class History(TimestampedModel):
     
     def __str__(self):
         return f"{self.method} {self.endpoint} - {self.user.username if self.user else 'Anonymous'} ({self.created_at})"
+
+
+class PasswordResetOTP(TimestampedModel):
+    """Stores short-lived OTP codes for password reset/change via email."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name='password_reset_otps')
+    code = models.CharField(max_length=6)
+    expires_at = models.DateTimeField()
+    is_used = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['expires_at']),
+            models.Index(fields=['is_used']),
+        ]
+
+    def __str__(self):
+        return f"OTP for {self.user.username} (used={self.is_used})"

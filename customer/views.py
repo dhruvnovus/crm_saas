@@ -1,27 +1,78 @@
-from rest_framework import status, generics
+from rest_framework import status, generics, filters
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
+from drf_yasg import openapi
 from django.utils.decorators import method_decorator
 from .models import Customer
+from user.models import CustomUser
 from .serializers import CustomerSerializer
 
 
-@method_decorator(name='get', decorator=swagger_auto_schema(tags=['Customers']))
-@method_decorator(name='post', decorator=swagger_auto_schema(tags=['Customers']))
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        responses={
+            200: openapi.Response(
+                description='List customers',
+                examples={
+                    'application/json': {
+                        'count': 1,
+                        'next': None,
+                        'previous': None,
+                        'results': [
+                            {
+                                'id': 'uuid-here',
+                                'name': 'Acme Contact',
+                                'email': 'contact@acme.com',
+                                'phone': '+1-202-555-0114',
+                                'is_active': True,
+                            }
+                        ],
+                    }
+                },
+            )
+        },
+    ),
+)
+@method_decorator(
+    name='post',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        operation_description='Create a customer in the current tenant',
+        responses={
+            201: openapi.Response(
+                description='Customer created',
+                examples={
+                    'application/json': {
+                        'id': 'uuid-here',
+                        'name': 'Acme Contact',
+                        'email': 'contact@acme.com',
+                        'phone': '+1-202-555-0114',
+                        'is_active': True,
+                    }
+                },
+            ),
+            400: openapi.Response(description='Validation error'),
+        },
+    ),
+)
 class CustomerListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = CustomerSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name', 'email', 'phone', 'company', 'city', 'state', 'country']
 
     def get_queryset(self):
         # Scope to current tenant
         if hasattr(self.request.user, 'tenant') and self.request.user.tenant:
             from django.db import connections
             connections['default'].tenant = self.request.user.tenant
-            return Customer.objects.filter(tenant=self.request.user.tenant)
+            # Default ordering: newest first
+            return Customer.objects.filter(tenant=self.request.user.tenant).order_by('-created_at')
         return Customer.objects.none()
 
-    @swagger_auto_schema(operation_description="Create a customer in the current tenant", tags=['Customers'])
     def create(self, request, *args, **kwargs):
         if not request.user or not request.user.is_authenticated:
             return Response({'detail': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
@@ -29,6 +80,27 @@ class CustomerListCreateView(generics.ListCreateAPIView):
             return Response({'detail': 'No tenant associated'}, status=status.HTTP_400_BAD_REQUEST)
         from django.db import connections
         connections['default'].tenant = request.user.tenant
+        # Ensure the acting user exists in the tenant database so FK constraints pass
+        # Some flows authenticate against the main DB; we mirror the user into the
+        # tenant DB on-demand using the same primary key.
+        try:
+            # Check presence in the tenant DB context
+            CustomUser.objects.get(id=request.user.id)
+        except CustomUser.DoesNotExist:
+            # Create a lightweight clone in the tenant DB with the same ID
+            # Password hash and flags are copied to preserve auth semantics if used.
+            CustomUser.objects.create(
+                id=request.user.id,
+                username=request.user.username,
+                email=request.user.email,
+                first_name=request.user.first_name,
+                last_name=request.user.last_name,
+                is_active=request.user.is_active,
+                is_staff=request.user.is_staff,
+                is_superuser=request.user.is_superuser,
+                password=request.user.password,
+                tenant=request.user.tenant,
+            )
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         customer = Customer(
@@ -40,14 +112,65 @@ class CustomerListCreateView(generics.ListCreateAPIView):
         return Response(CustomerSerializer(customer).data, status=status.HTTP_201_CREATED)
 
 
-@method_decorator(name='get', decorator=swagger_auto_schema(tags=['Customers']))
-@method_decorator(name='put', decorator=swagger_auto_schema(tags=['Customers']))
-@method_decorator(name='patch', decorator=swagger_auto_schema(tags=['Customers']))
-@method_decorator(name='delete', decorator=swagger_auto_schema(tags=['Customers']))
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        responses={
+            200: openapi.Response(
+                description='Retrieve customer',
+                examples={
+                    'application/json': {
+                        'id': 'uuid-here',
+                        'name': 'Acme Contact',
+                        'email': 'contact@acme.com',
+                        'phone': '+1-202-555-0114',
+                        'is_active': True,
+                    }
+                },
+            ),
+            404: openapi.Response(description='Not found'),
+        },
+    ),
+)
+@method_decorator(
+    name='patch',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        responses={
+            200: openapi.Response(
+                description='Customer updated',
+                examples={
+                    'application/json': {
+                        'id': 'uuid-here',
+                        'name': 'Acme Contact Updated',
+                        'email': 'contact@acme.com',
+                        'phone': '+1-202-555-0114',
+                        'is_active': True,
+                    }
+                },
+            ),
+            400: openapi.Response(description='Validation error'),
+        },
+    ),
+)
+@method_decorator(
+    name='delete',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        responses={
+            200: openapi.Response(
+                description='Soft delete confirmation',
+                examples={'application/json': {'message': 'Customer soft-deleted'}},
+            ),
+        },
+    ),
+)
 class CustomerDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = CustomerSerializer
     lookup_field = 'pk'
+    http_method_names = ['get', 'patch', 'delete']  # Exclude PUT
 
     def get_queryset(self):
         if hasattr(self.request.user, 'tenant') and self.request.user.tenant:
@@ -61,7 +184,6 @@ class CustomerDetailView(generics.RetrieveUpdateDestroyAPIView):
         connections['default'].tenant = self.request.user.tenant
         serializer.save()
 
-    @swagger_auto_schema(operation_description="Soft delete a customer", tags=['Customers'])
     def delete(self, request, *args, **kwargs):
         instance = self.get_object()
         from django.db import connections

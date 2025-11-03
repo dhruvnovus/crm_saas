@@ -91,8 +91,14 @@ python manage.py createsuperuser
 python manage.py makemigrations
 python manage.py migrate
 
-# Create the token table for a tenant (if missing)
-python manage.py create_token_table <TENANT_NAME>
+# Run full migrations for a specific tenant (creates DB if needed)
+python manage.py migrate_tenant <TENANT_NAME> --create
+
+# Apply only leads app migrations to one or all tenants
+python manage.py migrate_leads --tenant-name <TENANT_NAME>
+python manage.py migrate_leads --all-tenants
+# Optionally generate app migrations before applying to tenants
+python manage.py migrate_leads --all-tenants --makemigrations
 
 # If a tenant DB needs structure setup/fix (tables, FKs, columns)
 # All tenants
@@ -104,17 +110,8 @@ python manage.py setup_tenant_tables --database-name crm_tenant_<tenant>
 # Fix foreign keys/columns across all tenants
 python manage.py setup_tenant_tables --fix-foreign-keys
 
-# Run full migrations for a specific tenant (creates DB if needed)
-python manage.py migrate_tenant <TENANT_NAME> --create
-
-# Apply only leads app migrations to one or all tenants
-python manage.py migrate_leads --tenant-name <TENANT_NAME>
-python manage.py migrate_leads --all-tenants
-# Optionally generate app migrations before applying to tenants
-python manage.py migrate_leads --all-tenants --makemigrations
-
-# Migrate auth token tables inside a tenant DB
-python manage.py migrate_authtoken_to_tenant <TENANT_NAME>
+# Create the token table for a tenant (if missing)
+python manage.py create_token_table <TENANT_NAME>
 
 # If authentication tables are missing/broken in one or all tenants
 python manage.py fix_tenant_auth <TENANT_NAME>
@@ -142,19 +139,45 @@ python manage.py runserver
 - `POST /api/auth/register/` - Register new user and create tenant
 - `POST /api/auth/login/` - User login and token generation
 - `POST /api/auth/logout/` - User logout and token deletion
+- `GET /api/auth/test/` - Test endpoint for connectivity
 - `GET /api/auth/profile/` - Get current user profile
-- `PUT /api/auth/profile/update/` - Update user profile
+- `PATCH /api/auth/profile/update/` - Update user profile (partial)
+- `POST /api/auth/password/change/` - Change password (authenticated)
+- `POST /api/auth/password/forgot/` - Request password reset OTP by email
+- `POST /api/auth/password/reset/` - Reset password using email + OTP
+
+### Customer Endpoints
+- `GET /api/customers/` - List customers (paginated)
+- `POST /api/customers/` - Create a customer
+- `GET /api/customers/<uuid>/` - Retrieve a customer
+- `PATCH /api/customers/<uuid>/` - Update a customer
+- `DELETE /api/customers/<uuid>/` - Soft delete a customer
+
+### Lead Endpoints
+- `GET /api/leads/` - List leads (paginated)
+- `POST /api/leads/` - Create a lead
+- `GET /api/leads/<uuid>/` - Retrieve a lead
+- `PATCH /api/leads/<uuid>/` - Update a lead
+- `DELETE /api/leads/<uuid>/` - Soft delete a lead
+- `PATCH /api/leads/<uuid>/status/` - Update lead status only
 
 ### Tenant Management
-- `GET /api/auth/tenants/` - List all tenants
-- `POST /api/auth/tenants/` - Create new tenant
-- `GET /api/auth/tenant/users/` - Get users for current tenant
-- `POST /api/auth/tenant/users/create/` - Create user within tenant
+- `GET /api/auth/tenants/` - List tenants
+- `POST /api/auth/tenants/` - Create tenant
+- `GET /api/auth/tenants/<uuid>/` - Retrieve tenant
+- `PATCH /api/auth/tenants/<uuid>/` - Update tenant
+- `DELETE /api/auth/tenants/<uuid>/` - Delete tenant
 
 ### History & Logging
 - `GET /api/auth/history/` - Get API request history
 - `GET /api/auth/history/<uuid>/` - Get specific history record
 - `GET /api/auth/history/statistics/` - Get usage statistics
+
+### API Schema & Docs
+- `GET /api/schema/` - Raw OpenAPI schema (JSON)
+- `GET /swagger/` - Swagger UI
+- `GET /redoc/` - ReDoc UI
+- `GET /swagger.json` - OpenAPI schema (JSON)
 
 ### Testing
 - `GET /api/auth/test/` - Test endpoint for connectivity
@@ -206,15 +229,97 @@ curl -X POST http://localhost:8000/api/auth/tenant/users/create/ \
   }'
 ```
 
+### List Customers (paginated)
+```bash
+curl -X GET "http://localhost:8000/api/customers/?page=1&page_size=20" \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "X-Tenant: tenant_name"
+```
+
+### Create Customer
+```bash
+curl -X POST http://localhost:8000/api/customers/ \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant: tenant_name" \
+  -d '{
+    "name": "Acme Contact",
+    "email": "contact@acme.com",
+    "phone": "+1-202-555-0114"
+  }'
+```
+
+### List Leads (paginated)
+```bash
+curl -X GET "http://localhost:8000/api/leads/?page=1&page_size=20" \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "X-Tenant: tenant_name"
+```
+
+### Create Lead (link by customer email or ID)
+```bash
+curl -X POST http://localhost:8000/api/leads/ \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant: tenant_name" \
+  -d '{
+    "name": "Website Inquiry",
+    "status": "new",
+    "customer_email": "contact@acme.com"
+  }'
+```
+
+### Update Lead Status Only
+```bash
+curl -X PATCH http://localhost:8000/api/leads/<LEAD_UUID>/status/ \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant: tenant_name" \
+  -d '{
+    "status": "won"
+  }'
+```
+
+### Change Password (authenticated)
+```bash
+curl -X POST http://localhost:8000/api/auth/password/change/ \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "old_password": "oldpass123",
+    "new_password": "NewStrongPass!234"
+  }'
+```
+
+### Forgot Password (request OTP)
+```bash
+curl -X POST http://localhost:8000/api/auth/password/forgot/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "john@example.com"
+  }'
+```
+
+### Reset Password (with OTP)
+```bash
+curl -X POST http://localhost:8000/api/auth/password/reset/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "john@example.com",
+    "otp": "123456",
+    "new_password": "NewStrongPass!234"
+  }'
+```
+
 ## 🔧 Management Commands
 
 The project includes several custom management commands for tenant management:
 
 ```bash
-# Create Token table in a specific tenant DB
-python manage.py create_token_table <TENANT_NAME>
+# Set up a tenant record and its database
+python manage.py setup_tenant <TENANT_NAME> [--database-name crm_tenant_<tenant>]
 
-# Run migrations for a specific tenant (will connect and migrate that DB)
+# Run migrations for a specific tenant (connects and migrates that DB)
 python manage.py migrate_tenant <TENANT_NAME> [--create]
 
 # Apply only leads app migrations
@@ -227,21 +332,15 @@ python manage.py setup_tenant_tables --tenant-id <TENANT_ID>
 python manage.py setup_tenant_tables --database-name crm_tenant_<tenant>
 python manage.py setup_tenant_tables --fix-foreign-keys
 
-# Migrate Django authtoken tables to tenant DB
-python manage.py migrate_authtoken_to_tenant <TENANT_NAME>
-
 # Fix missing/broken auth tables inside tenant DB(s)
 python manage.py fix_tenant_auth <TENANT_NAME>
 python manage.py fix_tenant_auth <TENANT_NAME> --all
 
-# Migrate existing users into tenant DB (data copy)
-python manage.py migrate_users_to_tenant <TENANT_NAME>
+# Create Token table in a specific tenant DB (if missing)
+python manage.py create_token_table <TENANT_NAME>
 
-# Copy a single user into tenant DB (testing)
-python manage.py copy_user_to_tenant <USERNAME> <TENANT_NAME>
-
-# Recreate a tenant database from scratch (DANGER: drops DB)
-python manage.py recreate_tenant_db <TENANT_NAME>
+# Create a tenant admin user
+python manage.py create_tenant_admin --tenant <TENANT_NAME> --username <u> --email <e> --password <p>
 ```
 
 ## 🏢 Multi-Tenancy Implementation
@@ -255,6 +354,11 @@ python manage.py recreate_tenant_db <TENANT_NAME>
 - Automatic database selection based on tenant context
 - Complete data isolation between tenants
 - Dynamic database creation for new tenants
+
+### Pagination
+- Enabled globally via DRF `DEFAULT_PAGINATION_CLASS` (`crm_saas.pagination.CustomPageNumberPagination`).
+- Defaults: `page_size=20`, `max_page_size=100`.
+- Use query params: `?page=<number>&page_size=<number>`.
 
 ### Security Features
 - Token-based authentication

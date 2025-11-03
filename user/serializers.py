@@ -1,6 +1,12 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
-from .models import Tenant, TenantUser, CustomUser, History
+from .models import Tenant, TenantUser, CustomUser, History, PasswordResetOTP
+from django.contrib.auth.password_validation import validate_password
+from django.utils.translation import gettext_lazy as _
+from django.utils.http import urlsafe_base64_decode
+from django.utils.encoding import force_str
+from django.contrib.auth.tokens import default_token_generator
+from django.utils import timezone
 
 
 class TenantSerializer(serializers.ModelSerializer):
@@ -24,21 +30,40 @@ class TenantUserSerializer(serializers.ModelSerializer):
 class UserRegistrationSerializer(serializers.ModelSerializer):
     """Serializer for user registration"""
     password = serializers.CharField(write_only=True, min_length=8)
-    password_confirm = serializers.CharField(write_only=True)
     tenant_name = serializers.CharField(write_only=True)
+    email = serializers.EmailField(required=True)
+    first_name = serializers.CharField(required=True)
+    last_name = serializers.CharField(required=True)
     
     class Meta:
         model = CustomUser
-        fields = ['username', 'email', 'password', 'password_confirm', 'tenant_name', 'first_name', 'last_name']
+        fields = ['username', 'email', 'password', 'tenant_name', 'first_name', 'last_name']
+    
+    def validate_username(self, value):
+        """Ensure username is unique in the main database (for tenant admins)"""
+        from django.db import connections
+        # Tenant admins are stored in main database
+        connections['default'].tenant = None
+        if CustomUser.objects.filter(username=value).exists():
+            raise serializers.ValidationError("A user with that username already exists.")
+        return value
+    
+    def validate_email(self, value):
+        """Ensure email is unique in the main database (for tenant admins)"""
+        if not value:
+            return value
+        from django.db import connections
+        # Tenant admins are stored in main database
+        connections['default'].tenant = None
+        if CustomUser.objects.filter(email=value).exists():
+            raise serializers.ValidationError("A user with that email already exists.")
+        return value
     
     def validate(self, attrs):
-        if attrs['password'] != attrs['password_confirm']:
-            raise serializers.ValidationError("Passwords don't match")
         return attrs
     
     def create(self, validated_data):
-        # Remove password_confirm and tenant_name from validated_data
-        validated_data.pop('password_confirm')
+        # Remove tenant_name from validated_data
         tenant_name = validated_data.pop('tenant_name')
         
         # Create or get tenant
@@ -53,6 +78,36 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         if created:
             # Create database for new tenant
             tenant.create_database()
+
+            # After creating the tenant DB, run migrations to create all tables
+            # so the tenant is ready to use immediately after registration
+            try:
+                from django.conf import settings
+                from django.db import connections
+                from django.core.management import call_command
+
+                database_name = tenant.database_name
+
+                # Add dynamic DB config for this tenant if not present
+                if database_name not in connections.databases:
+                    connections.databases[database_name] = {
+                        'ENGINE': 'django.db.backends.mysql',
+                        'NAME': database_name,
+                        'USER': settings.DATABASES['default']['USER'],
+                        'PASSWORD': settings.DATABASES['default']['PASSWORD'],
+                        'HOST': settings.DATABASES['default']['HOST'],
+                        'PORT': settings.DATABASES['default']['PORT'],
+                        'OPTIONS': {
+                            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+                        },
+                    }
+
+                # Run migrations for the tenant database (creates user/customer/leads/authtoken tables, etc.)
+                call_command('migrate', database=database_name, verbosity=0)
+            except Exception:
+                # If migrations fail here, we still allow registration to succeed;
+                # tenant APIs will error until an admin fixes the DB.
+                pass
         
         # Create user
         user = CustomUser.objects.create_user(**validated_data)
@@ -70,12 +125,22 @@ class UserLoginSerializer(serializers.Serializer):
     """Serializer for user login with automatic tenant detection"""
     username = serializers.CharField()
     password = serializers.CharField()
-    tenant = serializers.CharField(required=False, help_text="Tenant name for tenant users (optional)")
     
     def validate(self, attrs):
         username = attrs.get('username')
         password = attrs.get('password')
-        tenant_name = attrs.get('tenant')
+        # Determine tenant from request context (header/subdomain), not from payload
+        request = self.context.get('request') if hasattr(self, 'context') else None
+        tenant_name = None
+        if request is not None:
+            # Prefer explicit header
+            tenant_name = request.META.get('HTTP_X_TENANT')
+            # If middleware has set request.tenant (object), use its name when header not present
+            if not tenant_name and hasattr(request, 'tenant') and getattr(request, 'tenant', None):
+                try:
+                    tenant_name = getattr(request.tenant, 'name', None)
+                except Exception:
+                    tenant_name = None
         
         if username and password:
             # Allow login with email by converting to username if needed
@@ -170,6 +235,77 @@ class UserSerializer(serializers.ModelSerializer):
         model = CustomUser
         fields = ['id', 'username', 'email', 'first_name', 'last_name', 'tenant', 'is_tenant_admin', 'is_superuser', 'date_joined']
         read_only_fields = ['id', 'date_joined']
+    
+    def validate_username(self, value):
+        """Ensure username is unique within the same tenant context"""
+        # Get the current user instance if updating
+        user = self.instance
+        if not user:
+            return value
+        
+        # Determine tenant context based on user type
+        from django.db import connections
+        original_tenant = connections['default'].tenant
+        
+        try:
+            if getattr(user, 'is_tenant_admin', False):
+                # Tenant admins are in main database
+                connections['default'].tenant = None
+            elif hasattr(user, 'tenant') and user.tenant:
+                # Regular tenant users are in tenant database
+                connections['default'].tenant = user.tenant
+            else:
+                # No tenant - check in main database
+                connections['default'].tenant = None
+            
+            # Check if username is already taken by another user in the same tenant
+            queryset = CustomUser.objects.filter(username=value)
+            queryset = queryset.exclude(pk=user.pk)
+            
+            if queryset.exists():
+                raise serializers.ValidationError("A user with that username already exists in this tenant.")
+        finally:
+            # Restore original tenant context
+            connections['default'].tenant = original_tenant
+        
+        return value
+    
+    def validate_email(self, value):
+        """Ensure email is unique within the same tenant context"""
+        if not value:
+            return value
+        
+        # Get the current user instance if updating
+        user = self.instance
+        if not user:
+            return value
+        
+        # Determine tenant context based on user type
+        from django.db import connections
+        original_tenant = connections['default'].tenant
+        
+        try:
+            if getattr(user, 'is_tenant_admin', False):
+                # Tenant admins are in main database
+                connections['default'].tenant = None
+            elif hasattr(user, 'tenant') and user.tenant:
+                # Regular tenant users are in tenant database
+                connections['default'].tenant = user.tenant
+            else:
+                # No tenant - check in main database
+                connections['default'].tenant = None
+            
+            # Check if email is already taken by another user in the same tenant
+            queryset = CustomUser.objects.filter(email=value)
+            queryset = queryset.exclude(pk=user.pk)
+            
+            if queryset.exists():
+                raise serializers.ValidationError("A user with that email already exists in this tenant.")
+        finally:
+            # Restore original tenant context
+            connections['default'].tenant = original_tenant
+        
+        return value
 
 
 class HistorySerializer(serializers.ModelSerializer):
@@ -216,6 +352,41 @@ class CreateTenantUserSerializer(serializers.ModelSerializer):
         model = CustomUser
         fields = ['username', 'email', 'password', 'first_name', 'last_name']
     
+    def validate_username(self, value):
+        """Ensure username is unique within the tenant database"""
+        tenant = self.context.get('tenant')
+        if not tenant:
+            return value
+        
+        from django.db import connections
+        connections['default'].tenant = tenant
+        
+        if CustomUser.objects.filter(username=value).exists():
+            connections['default'].tenant = None
+            raise serializers.ValidationError("A user with that username already exists in this tenant.")
+        
+        connections['default'].tenant = None
+        return value
+    
+    def validate_email(self, value):
+        """Ensure email is unique within the tenant database"""
+        if not value:
+            return value
+        
+        tenant = self.context.get('tenant')
+        if not tenant:
+            return value
+        
+        from django.db import connections
+        connections['default'].tenant = tenant
+        
+        if CustomUser.objects.filter(email=value).exists():
+            connections['default'].tenant = None
+            raise serializers.ValidationError("A user with that email already exists in this tenant.")
+        
+        connections['default'].tenant = None
+        return value
+    
     def create(self, validated_data):
         """Create user with tenant context"""
         tenant = self.context['tenant']
@@ -233,3 +404,193 @@ class CreateTenantUserSerializer(serializers.ModelSerializer):
         TenantUser.objects.get_or_create(user=user, tenant=tenant)
         
         return user
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """Serializer for authenticated user to change password"""
+    old_password = serializers.CharField(write_only=True)
+    new_password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        user = self.context['request'].user
+        if not user.check_password(attrs.get('old_password')):
+            raise serializers.ValidationError({'old_password': _('Old password is incorrect')})
+        validate_password(attrs.get('new_password'), user=user)
+        return attrs
+
+    def save(self, **kwargs):
+        from django.db import connections
+        user = self.context['request'].user
+        new_password = self.validated_data['new_password']
+
+        original_tenant = getattr(connections['default'], 'tenant', None)
+        try:
+            # Route to the DB where the user record lives
+            if hasattr(user, 'tenant') and user.tenant:
+                setattr(connections['default'], 'tenant', user.tenant)
+            else:
+                setattr(connections['default'], 'tenant', None)
+
+            user.set_password(new_password)
+            # Avoid update_fields to prevent 0-rows-updated with cross-DB contexts
+            user.save()
+            return user
+        finally:
+            setattr(connections['default'], 'tenant', original_tenant)
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    """Serializer for requesting a password reset via email"""
+    email = serializers.EmailField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    """Serializer to confirm reset with uid, token and new password"""
+    uidb64 = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True)
+    tenant = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        uidb64 = attrs.get('uidb64')
+        token = attrs.get('token')
+        tenant_name = attrs.get('tenant')
+
+        # Determine tenant context and resolve user
+        from django.db import connections
+        original_tenant = connections['default'].tenant
+        try:
+            if tenant_name:
+                try:
+                    tenant_obj = Tenant.objects.get(name=tenant_name, is_active=True)
+                    connections['default'].tenant = tenant_obj
+                except Tenant.DoesNotExist:
+                    # If invalid tenant provided, treat as main DB
+                    connections['default'].tenant = None
+            else:
+                connections['default'].tenant = None
+
+            try:
+                uid = force_str(urlsafe_base64_decode(uidb64))
+            except Exception:
+                raise serializers.ValidationError({'uidb64': _('Invalid uid')})
+
+            try:
+                user = CustomUser.objects.get(pk=uid)
+            except CustomUser.DoesNotExist:
+                raise serializers.ValidationError({'uidb64': _('User not found')})
+
+            if not default_token_generator.check_token(user, token):
+                raise serializers.ValidationError({'token': _('Invalid or expired token')})
+
+            # Validate password via Django validators
+            validate_password(attrs.get('new_password'), user=user)
+
+            attrs['user'] = user
+            return attrs
+        finally:
+            connections['default'].tenant = original_tenant
+
+    def save(self, **kwargs):
+        user = self.validated_data['user']
+        new_password = self.validated_data['new_password']
+        user.set_password(new_password)
+        user.save(update_fields=['password'])
+        return user
+
+
+class PasswordOTPRequestSerializer(serializers.Serializer):
+    """Serializer for requesting a password reset/change OTP by email"""
+    email = serializers.EmailField()
+
+
+class PasswordOTPVerifySerializer(serializers.Serializer):
+    """Serializer for verifying an OTP for a given email"""
+    email = serializers.EmailField()
+    otp = serializers.CharField(max_length=6)
+
+
+class ChangePasswordWithOTPSerializer(serializers.Serializer):
+    """Serializer for changing password using email + OTP"""
+    email = serializers.EmailField()
+    otp = serializers.CharField(max_length=6)
+    new_password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        email = attrs.get('email')
+        otp = attrs.get('otp')
+
+        # Resolve user by email across main DB and tenants
+        from django.db import connections
+        original_tenant = getattr(connections['default'], 'tenant', None)
+        user = None
+        user_tenant = None
+        try:
+            # Try main db
+            setattr(connections['default'], 'tenant', None)
+            try:
+                user = CustomUser.objects.get(email=email)
+            except CustomUser.DoesNotExist:
+                user = None
+
+            # Try tenants
+            if not user:
+                for t in Tenant.objects.filter(is_active=True):
+                    setattr(connections['default'], 'tenant', t)
+                    try:
+                        found = CustomUser.objects.get(email=email)
+                        user = found
+                        user_tenant = t
+                        break
+                    except CustomUser.DoesNotExist:
+                        continue
+
+            if not user:
+                raise serializers.ValidationError({'email': _('No account found for this email')})
+
+            # OTP is stored in main DB; force main DB for OTP lookups
+            setattr(connections['default'], 'tenant', None)
+            now = timezone.now()
+            try:
+                otp_obj = PasswordResetOTP.objects.filter(user=user, code=otp, is_used=False, expires_at__gte=now).order_by('-created_at').first()
+            except Exception:
+                otp_obj = None
+
+            if not otp_obj:
+                raise serializers.ValidationError({'otp': _('Invalid or expired OTP')})
+
+            # Validate password complexity
+            validate_password(attrs.get('new_password'), user=user)
+
+            attrs['user'] = user
+            attrs['user_tenant'] = user_tenant
+            attrs['otp_obj'] = otp_obj
+            return attrs
+        finally:
+            setattr(connections['default'], 'tenant', original_tenant)
+
+    def save(self, **kwargs):
+        from django.db import connections
+        user = self.validated_data['user']
+        user_tenant = self.validated_data['user_tenant']
+        otp_obj = self.validated_data['otp_obj']
+        new_password = self.validated_data['new_password']
+
+        original_tenant = getattr(connections['default'], 'tenant', None)
+        try:
+            # Save password in the DB where user lives
+            if user_tenant:
+                setattr(connections['default'], 'tenant', user_tenant)
+            else:
+                setattr(connections['default'], 'tenant', None)
+
+            user.set_password(new_password)
+            user.save(update_fields=['password'])
+
+            # Mark OTP used in main DB
+            setattr(connections['default'], 'tenant', None)
+            otp_obj.is_used = True
+            otp_obj.save(update_fields=['is_used', 'updated_at'])
+            return user
+        finally:
+            setattr(connections['default'], 'tenant', original_tenant)

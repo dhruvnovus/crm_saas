@@ -194,7 +194,66 @@ class Command(BaseCommand):
                     cursor.execute(create_statement)
                     self.stdout.write(f'Created table: {table_name}')
                 else:
-                    self.stdout.write(f'Warning: Table {table_name} not found in main database')
+                    # If not present in main DB (by design for tenant-only apps), create explicitly
+                    cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+                    if cursor.fetchone():
+                        self.stdout.write(f'Table {table_name} already exists, skipping')
+                        continue
+                    if table_name == 'customer_customer':
+                        # Create customer table with FKs to user_customuser (created_by)
+                        create_sql = """
+                            CREATE TABLE IF NOT EXISTS `customer_customer` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `name` varchar(255) NOT NULL,
+                                `email` varchar(254) NULL,
+                                `phone` varchar(50) NULL,
+                                `company` varchar(255) NULL,
+                                `created_by_id` bigint NULL,
+                                `address` longtext NULL,
+                                `city` varchar(120) NULL,
+                                `state` varchar(120) NULL,
+                                `country` varchar(120) NULL,
+                                `zip_code` varchar(20) NULL,
+                                `is_active` tinyint(1) NOT NULL DEFAULT 1,
+                                KEY `customer_customer_tenant_name_idx` (`tenant_id`, `name`),
+                                KEY `customer_customer_tenant_email_idx` (`tenant_id`, `email`),
+                                UNIQUE KEY `customer_unique_tenant_email` (`tenant_id`, `email`),
+                                CONSTRAINT `customer_created_by_fk` FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: customer_customer (explicit)')
+                    elif table_name == 'leads_lead':
+                        # Create leads table with FKs to customer_customer and user_customuser
+                        create_sql = """
+                            CREATE TABLE IF NOT EXISTS `leads_lead` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `customer_id` char(32) NULL,
+                                `name` varchar(255) NOT NULL,
+                                `email` varchar(254) NULL,
+                                `phone` varchar(50) NULL,
+                                `status` varchar(20) NOT NULL DEFAULT 'new',
+                                `source` varchar(120) NULL,
+                                `notes` longtext NULL,
+                                `created_by_id` bigint NULL,
+                                `is_active` tinyint(1) NOT NULL DEFAULT 1,
+                                KEY `leads_lead_tenant_name_idx` (`tenant_id`, `name`),
+                                KEY `leads_lead_tenant_email_idx` (`tenant_id`, `email`),
+                                KEY `leads_lead_tenant_status_idx` (`tenant_id`, `status`),
+                                CONSTRAINT `leads_created_by_fk` FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE,
+                                CONSTRAINT `leads_customer_fk` FOREIGN KEY (`customer_id`) REFERENCES `customer_customer` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: leads_lead (explicit)')
+                    else:
+                        self.stdout.write(f'Warning: Table {table_name} not found in main database')
             
             # Create missing Django built-in tables
             self.create_django_builtin_tables(cursor)
@@ -203,6 +262,8 @@ class Command(BaseCommand):
             self.fix_user_customuser_table(cursor)
             # Ensure customer new columns exist
             self.ensure_customer_columns(cursor)
+            # Ensure leads table FKs are relaxed if any
+            self.fix_leads_table(cursor)
             
             # Re-enable foreign key checks
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
@@ -335,7 +396,7 @@ class Command(BaseCommand):
                     self.stdout.write(f"Dropping foreign key {constraint} on {table_name}.{column_name}")
                     cursor.execute(f"ALTER TABLE `{table_name}` DROP FOREIGN KEY `{constraint}`")
 
-            # Fix user_customuser table
+            # Fix user_customuser table (only relax tenant_id; keep created_by/customer FKs)
             cursor.execute("SHOW TABLES LIKE 'user_customuser'")
             if cursor.fetchone():
                 drop_foreign_keys('user_customuser', 'tenant_id')
@@ -356,17 +417,12 @@ class Command(BaseCommand):
                     pass
                 self.stdout.write('Checked and fixed FKs for user_tenantuser')
 
-            # Fix customer_customer table
+            # Fix customer_customer table: keep FK on created_by_id, only relax tenant_id
             cursor.execute("SHOW TABLES LIKE 'customer_customer'")
             if cursor.fetchone():
                 drop_foreign_keys('customer_customer', 'tenant_id')
-                drop_foreign_keys('customer_customer', 'created_by_id')
                 try:
                     cursor.execute("ALTER TABLE customer_customer MODIFY COLUMN tenant_id char(32) NULL")
-                except Exception:
-                    pass
-                try:
-                    cursor.execute("ALTER TABLE customer_customer MODIFY COLUMN created_by_id bigint NULL")
                 except Exception:
                     pass
                 self.stdout.write('Checked and fixed FKs for customer_customer')
@@ -393,21 +449,13 @@ class Command(BaseCommand):
 
             cursor.execute("SHOW TABLES LIKE 'leads_lead'")
             if cursor.fetchone():
-                for col in ['tenant_id', 'created_by_id', 'customer_id']:
-                    drop_foreign_keys('leads_lead', col)
+                # Only relax tenant_id; keep created_by_id and customer_id foreign keys
+                drop_foreign_keys('leads_lead', 'tenant_id')
                 try:
                     cursor.execute("ALTER TABLE leads_lead MODIFY COLUMN tenant_id char(32) NULL")
                 except Exception:
                     pass
-                try:
-                    cursor.execute("ALTER TABLE leads_lead MODIFY COLUMN created_by_id bigint NULL")
-                except Exception:
-                    pass
-                try:
-                    cursor.execute("ALTER TABLE leads_lead MODIFY COLUMN customer_id char(32) NULL")
-                except Exception:
-                    pass
-                self.stdout.write('Checked and fixed FKs for leads_lead')
+                self.stdout.write('Checked and fixed FKs for leads_lead (kept created_by_id, customer_id)')
         except Exception as e:
             self.stdout.write(f'Warning: Could not fix leads_lead table: {str(e)}')
 

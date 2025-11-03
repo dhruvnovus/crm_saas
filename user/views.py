@@ -20,8 +20,18 @@ from .serializers import (
     TenantSerializer,
     HistorySerializer,
     HistoryListSerializer,
-    CreateTenantUserSerializer
+    CreateTenantUserSerializer,
+    ChangePasswordSerializer,
+    PasswordResetRequestSerializer,
+    PasswordResetConfirmSerializer
 )
+from django.core.mail import send_mail
+from django.conf import settings
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.http import urlsafe_base64_encode
+from django.utils.encoding import force_bytes
+from django.utils import timezone
+import random
 
 
 @swagger_auto_schema(method='get', tags=['Authentication'])
@@ -82,7 +92,7 @@ def register(request):
 
 @swagger_auto_schema(
     method='post',
-    operation_description="Login user and get authentication token. Tenant field is optional - if not provided, system will try to authenticate against main database first, then all tenant databases.",
+    operation_description="Login user and get authentication token. Do NOT send tenant in the body. Tenant is inferred from subdomain or 'X-Tenant' header; if absent, authentication will try main DB, then all active tenants.",
     request_body=UserLoginSerializer,
     responses={
         200: openapi.Response(
@@ -130,15 +140,12 @@ def register(request):
 @permission_classes([AllowAny])
 def login(request):
     """Login user and return token"""
-    # Get tenant from header if not provided in data (optional for frontend)
+    # Ignore any tenant in payload; rely on header/subdomain via serializer context
     login_data = request.data.copy()
-    if 'tenant' not in login_data:
-        tenant_name = request.META.get('HTTP_X_TENANT')
-        if tenant_name:
-            login_data['tenant'] = tenant_name
-        # If no tenant provided, that's fine - the serializer will handle it
+    if 'tenant' in login_data:
+        login_data.pop('tenant', None)
     
-    serializer = UserLoginSerializer(data=login_data)
+    serializer = UserLoginSerializer(data=login_data, context={'request': request})
     if serializer.is_valid():
         user = serializer.validated_data['user']
 
@@ -246,20 +253,132 @@ def logout(request):
 @permission_classes([IsAuthenticated])
 def user_profile(request):
     """Get current user profile"""
-    serializer = UserSerializer(request.user)
+    from django.db import connections
+    
+    user = request.user
+    
+    # Tenant admins are stored in the main database and should always be queried from there
+    # Regular tenant users are stored in their tenant database
+    if getattr(user, 'is_tenant_admin', False):
+        # Tenant admin: ensure we query from main database
+        connections['default'].tenant = None
+        try:
+            # Refresh user from main database to ensure we have latest data
+            user = CustomUser.objects.get(pk=user.pk)
+        except CustomUser.DoesNotExist:
+            # If user not found in main DB, use the authenticated user instance
+            pass
+    elif hasattr(user, 'tenant') and user.tenant:
+        # Regular tenant user: query from tenant database
+        connections['default'].tenant = user.tenant
+        try:
+            # Refresh user from tenant database to ensure we have latest data
+            user = CustomUser.objects.get(pk=user.pk)
+        except CustomUser.DoesNotExist:
+            # If user not found in tenant DB, try main database as fallback
+            connections['default'].tenant = None
+            try:
+                user = CustomUser.objects.get(pk=user.pk)
+            except CustomUser.DoesNotExist:
+                # Use authenticated user instance if not found anywhere
+                pass
+    else:
+        # User without tenant: query from main database
+        connections['default'].tenant = None
+        try:
+            user = CustomUser.objects.get(pk=user.pk)
+        except CustomUser.DoesNotExist:
+            pass
+    
+    serializer = UserSerializer(user)
     return Response(serializer.data)
 
 
 @swagger_auto_schema(
-    method='put',
-    operation_description="Update user profile",
+    method='patch',
+    operation_description="Update user profile (partial update). All fields are optional.",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={
+            'username': openapi.Schema(
+                type=openapi.TYPE_STRING,
+                description='Username (must be unique)',
+                example='john_doe'
+            ),
+            'email': openapi.Schema(
+                type=openapi.TYPE_STRING,
+                format=openapi.FORMAT_EMAIL,
+                description='Email address',
+                example='john@example.com'
+            ),
+            'first_name': openapi.Schema(
+                type=openapi.TYPE_STRING,
+                description='First name',
+                example='John'
+            ),
+            'last_name': openapi.Schema(
+                type=openapi.TYPE_STRING,
+                description='Last name',
+                example='Doe'
+            ),
+        },
+        required=[]
+    ),
+    responses={
+        200: openapi.Response(
+            description="Profile updated successfully",
+            examples={
+                "application/json": {
+                    "id": 1,
+                    "username": "john_doe",
+                    "email": "john@example.com",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                    "tenant": {
+                        "id": "uuid-here",
+                        "name": "Acme Corp"
+                    },
+                    "is_tenant_admin": True,
+                    "date_joined": "2024-01-01T00:00:00Z"
+                }
+            }
+        ),
+        400: openapi.Response(
+            description="Validation errors",
+            examples={
+                "application/json": {
+                    "username": ["A user with that username already exists."],
+                    "email": ["Enter a valid email address."]
+                }
+            }
+        ),
+        401: openapi.Response(description="Authentication required")
+    },
     tags=['Tenant Management']
 )
-@api_view(['PUT'])
+@api_view(['PATCH'])
 @permission_classes([IsAuthenticated])
 def update_profile(request):
-    """Update user profile"""
-    serializer = UserSerializer(request.user, data=request.data, partial=True)
+    """Update user profile (partial update)"""
+    from django.db import connections
+    
+    user = request.user
+    
+    # Handle tenant context for user updates - this will be used by the serializer
+    if getattr(user, 'is_tenant_admin', False):
+        connections['default'].tenant = None
+    elif hasattr(user, 'tenant') and user.tenant:
+        connections['default'].tenant = user.tenant
+    else:
+        connections['default'].tenant = None
+    
+    # Refresh user from correct database to ensure we have the latest instance
+    try:
+        user = CustomUser.objects.get(pk=user.pk)
+    except CustomUser.DoesNotExist:
+        pass
+    
+    serializer = UserSerializer(user, data=request.data, partial=True)
     if serializer.is_valid():
         serializer.save()
         return Response(serializer.data)
@@ -273,12 +392,14 @@ class TenantListCreateView(generics.ListCreateAPIView):
     queryset = Tenant.objects.all()
     serializer_class = TenantSerializer
     permission_classes = [IsAuthenticated, IsSuperuserOnly]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name', 'database_name']
     
     def get_queryset(self):
         # Only show tenants for the current user
         if self.request.user.is_superuser:
-            return Tenant.objects.all()
-        return Tenant.objects.filter(tenantuser__user=self.request.user)
+            return Tenant.objects.all().order_by('-created_at')
+        return Tenant.objects.filter(tenantuser__user=self.request.user).order_by('-created_at')
 
 
 @method_decorator(name='get', decorator=swagger_auto_schema(tags=['Tenant Management']))
@@ -495,6 +616,15 @@ def history_statistics(request):
     if not request.user.is_superuser and request.user.tenant:
         queryset = queryset.filter(tenant=request.user.tenant)
     
+    # Optional: filter by response status (status-wise statistics)
+    status_param = request.query_params.get('status') or request.query_params.get('response_status')
+    if status_param:
+        try:
+            queryset = queryset.filter(response_status=int(status_param))
+        except (TypeError, ValueError):
+            # Ignore invalid status values; proceed without status filtering
+            pass
+    
     # Calculate statistics
     total_requests = queryset.count()
     
@@ -516,10 +646,10 @@ def history_statistics(request):
         avg_time=models.Avg('execution_time')
     )['avg_time'] or 0
     
-    # Most used endpoints
-    most_used_endpoints = queryset.values('endpoint').annotate(
-        count=models.Count('endpoint')
-    ).order_by('-count')[:5]
+    # Most used endpoints (group by endpoint, method, and response status)
+    most_used_endpoints = queryset.values('endpoint', 'method', 'response_status').annotate(
+        count=models.Count('id')
+    ).order_by('-count')
     
     # Requests today and this week
     today = timezone.now().date()
@@ -537,3 +667,276 @@ def history_statistics(request):
         'requests_today': requests_today,
         'requests_this_week': requests_this_week
     })
+
+
+# Password Management
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="Change password for authenticated user",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={
+            'old_password': openapi.Schema(type=openapi.TYPE_STRING),
+            'new_password': openapi.Schema(type=openapi.TYPE_STRING),
+        },
+        required=['old_password', 'new_password']
+    ),
+    tags=['Authentication']
+)
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def change_password(request):
+    serializer = ChangePasswordSerializer(data=request.data, context={'request': request})
+    if serializer.is_valid():
+        serializer.save()
+        return Response({'message': 'Password changed successfully'}, status=status.HTTP_200_OK)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="Forgot password - send OTP to email",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={'email': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_EMAIL)},
+        required=['email']
+    ),
+    tags=['Authentication']
+)
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def forgot_password(request):
+    from .models import PasswordResetOTP
+    serializer = PasswordResetRequestSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    email = serializer.validated_data['email']
+    from django.db import connections
+    # Safely capture current tenant context if set by middleware/router
+    original_tenant = getattr(connections['default'], 'tenant', None)
+    try:
+        # Locate user by email across main and all tenants
+        user = None
+        connections['default'].tenant = None
+        try:
+            user = CustomUser.objects.get(email=email)
+        except CustomUser.DoesNotExist:
+            for t in Tenant.objects.filter(is_active=True):
+                connections['default'].tenant = t
+                try:
+                    user = CustomUser.objects.get(email=email)
+                    break
+                except CustomUser.DoesNotExist:
+                    continue
+
+        # Always generic response if user not found
+        if not user:
+            return Response({'message': 'OTP has been sent.'}, status=status.HTTP_200_OK)
+
+        # Generate and store OTP (main DB)
+        code = f"{random.randint(100000, 999999)}"
+        expires_at = timezone.now() + timedelta(minutes=10)
+        connections['default'].tenant = None
+        PasswordResetOTP.objects.filter(user=user, is_used=False).update(is_used=True)
+        PasswordResetOTP.objects.create(user=user, code=code, expires_at=expires_at)
+
+        # Send email
+        subject = 'Your OTP for Password Reset'
+        message = (
+            'Use the following OTP to reset your password.\n\n'
+            f'OTP: {code}\n'
+            'This code expires in 10 minutes.\n\n'
+            'If you did not request this, please ignore this email.'
+        )
+        try:
+            send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [email], fail_silently=False)
+        except Exception:
+            # Do not disclose anything
+            pass
+
+        return Response({'message': 'OTP has been sent.'}, status=status.HTTP_200_OK)
+    finally:
+        setattr(connections['default'], 'tenant', original_tenant)
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="Reset password using email + OTP",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={
+            'email': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_EMAIL),
+            'otp': openapi.Schema(type=openapi.TYPE_STRING),
+            'new_password': openapi.Schema(type=openapi.TYPE_STRING),
+        },
+        required=['email', 'otp', 'new_password']
+    ),
+    tags=['Authentication']
+)
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def reset_password_confirm(request):
+    from .serializers import ChangePasswordWithOTPSerializer
+    serializer = ChangePasswordWithOTPSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response({'message': 'Password has been reset successfully'}, status=status.HTTP_200_OK)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# OTP helper types (no standalone endpoints now)
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="Request an OTP sent to email for password change/reset",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={'email': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_EMAIL)},
+        required=['email']
+    ),
+    tags=['Authentication']
+)
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def request_password_otp(request):
+    serializer = PasswordOTPRequestSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    email = serializer.validated_data['email']
+    from django.db import connections
+    original_tenant = getattr(connections['default'], 'tenant', None)
+    try:
+        # Find user by email in main or tenant DBs
+        user = None
+        user_tenant_name = ''
+        setattr(connections['default'], 'tenant', None)
+        try:
+            user = CustomUser.objects.get(email=email)
+        except CustomUser.DoesNotExist:
+            user = None
+
+        if not user:
+            for t in Tenant.objects.filter(is_active=True):
+                setattr(connections['default'], 'tenant', t)
+                try:
+                    user = CustomUser.objects.get(email=email)
+                    user_tenant_name = t.name
+                    break
+                except CustomUser.DoesNotExist:
+                    continue
+
+        # Always respond 200 (avoid enumeration), but only create OTP when user exists
+        if not user:
+            return Response({'message': 'OTP has been sent.'}, status=status.HTTP_200_OK)
+
+        # Generate 6-digit numeric OTP
+        code = f"{random.randint(100000, 999999)}"
+        expires_at = timezone.now() + timedelta(minutes=10)
+
+        # Store OTP in main DB regardless of tenant
+        setattr(connections['default'], 'tenant', None)
+        PasswordResetOTP.objects.filter(user=user, is_used=False).update(is_used=True)
+        PasswordResetOTP.objects.create(user=user, code=code, expires_at=expires_at)
+
+        # Email the OTP
+        subject = 'Your OTP for Password Change'
+        message = (
+            'Use the following OTP to change your password.\n\n'
+            f'OTP: {code}\n'
+            f'Tenant: {user_tenant_name or "(main)"}\n'
+            'This code expires in 10 minutes.\n\n'
+            'If you did not request this, please ignore this email.'
+        )
+        try:
+            send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [email], fail_silently=False)
+        except Exception:
+            # If email fails, don't reveal user existence
+            return Response({'message': 'OTP has been sent.'}, status=status.HTTP_200_OK)
+
+        return Response({'message': 'OTP has been sent.'}, status=status.HTTP_200_OK)
+    finally:
+        setattr(connections['default'], 'tenant', original_tenant)
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="Verify OTP sent to email",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={
+            'email': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_EMAIL),
+            'otp': openapi.Schema(type=openapi.TYPE_STRING),
+        },
+        required=['email', 'otp']
+    ),
+    tags=['Authentication']
+)
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def verify_password_otp(request):
+    serializer = PasswordOTPVerifySerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    email = serializer.validated_data['email']
+    otp = serializer.validated_data['otp']
+
+    from django.db import connections
+    original_tenant = getattr(connections['default'], 'tenant', None)
+    try:
+        # Resolve user by email (main then tenants)
+        user = None
+        setattr(connections['default'], 'tenant', None)
+        try:
+            user = CustomUser.objects.get(email=email)
+        except CustomUser.DoesNotExist:
+            for t in Tenant.objects.filter(is_active=True):
+                setattr(connections['default'], 'tenant', t)
+                try:
+                    user = CustomUser.objects.get(email=email)
+                    break
+                except CustomUser.DoesNotExist:
+                    continue
+
+        # Always generic response on missing user/otp
+        if not user:
+            return Response({'message': 'OTP verified' if False else 'Invalid OTP'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate OTP from main DB
+        setattr(connections['default'], 'tenant', None)
+        now = timezone.now()
+        otp_obj = PasswordResetOTP.objects.filter(user=user, code=otp, is_used=False, expires_at__gte=now).order_by('-created_at').first()
+        if not otp_obj:
+            return Response({'error': 'Invalid or expired OTP'}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({'message': 'OTP verified'}, status=status.HTTP_200_OK)
+    finally:
+        setattr(connections['default'], 'tenant', original_tenant)
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="Change password using email and OTP",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={
+            'email': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_EMAIL),
+            'otp': openapi.Schema(type=openapi.TYPE_STRING),
+            'new_password': openapi.Schema(type=openapi.TYPE_STRING),
+        },
+        required=['email', 'otp', 'new_password']
+    ),
+    tags=['Authentication']
+)
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def change_password_with_otp(request):
+    serializer = ChangePasswordWithOTPSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response({'message': 'Password changed successfully'}, status=status.HTTP_200_OK)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

@@ -126,11 +126,16 @@ class TenantDatabaseRouter:
     def allow_migrate(self, db, app_label, model_name=None, **hints):
         """Control which migrations run on which databases"""
         if app_label == 'user':
-            # Only tenant metadata and history migrate to default database
+            # Ensure Tenant and History live only in the main database
             if model_name in ['tenant', 'history']:
                 return db == 'default'
-            # For users and tenant-user relationships, use tenant databases
-            return db != 'default'
+            # Migrate CustomUser and TenantUser in BOTH default and tenant databases
+            # - Default DB: required for Django admin (django_admin_log.user FK)
+            # - Tenant DBs: required for tenant-scoped data relations
+            if model_name in ['customuser', 'tenantuser']:
+                return True
+            # Any other models in user app should default to main DB only
+            return db == 'default'
         elif app_label == 'authtoken':
             # Ensure Token model exists in both default and tenant databases
             # so superusers (default DB) and tenant users can authenticate

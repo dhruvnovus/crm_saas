@@ -11,9 +11,22 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables from a .env file if available
+try:
+    from dotenv import load_dotenv  # type: ignore
+    # Try project root and parent root
+    for env_path in [BASE_DIR / '.env', BASE_DIR.parent / '.env']:
+        if os.path.exists(env_path):
+            load_dotenv(dotenv_path=env_path)
+            break
+except Exception:
+    # Silently ignore if python-dotenv is not installed; env vars can still come from the environment
+    pass
 
 
 # Quick-start development settings - unsuitable for production
@@ -86,12 +99,12 @@ WSGI_APPLICATION = 'crm_saas.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'crm_saas_main',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': '127.0.0.1',
-        'PORT': '3306',
+        'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.mysql'),
+        'NAME': os.getenv('DB_NAME', 'crm_saas_main'),
+        'USER': os.getenv('DB_USER', 'root'),
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),
+        'HOST': os.getenv('DB_HOST', '127.0.0.1'),
+        'PORT': os.getenv('DB_PORT', '3306'),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
@@ -107,16 +120,8 @@ DATABASE_ROUTERS = ['user.routers.TenantDatabaseRouter']
 
 AUTH_PASSWORD_VALIDATORS = [
     {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
         'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+        'OPTIONS': {'min_length': 8},
     },
 ]
 
@@ -154,6 +159,7 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    'DEFAULT_PAGINATION_CLASS': 'crm_saas.pagination.CustomPageNumberPagination',
 }
 
 # Multi-tenant settings
@@ -171,7 +177,7 @@ SWAGGER_SETTINGS = {
         }
     },
     'USE_SESSION_AUTH': False,
-    'JSON_EDITOR': True,
+    'JSON_EDITOR': False,
     'SUPPORTED_SUBMIT_METHODS': [
         'get',
         'post',
@@ -194,3 +200,12 @@ REDOC_SETTINGS = {
 # CORS settings
 CORS_ALLOW_ALL_ORIGINS = True  # Only for development
 CORS_ALLOW_CREDENTIALS = True
+
+# Email settings (Gmail SMTP)
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'dhruv.novuscode@gmail.com'
+EMAIL_HOST_PASSWORD = 'icgw bxhu wpfq gypp'
+DEFAULT_FROM_EMAIL = EMAIL_HOST_USER

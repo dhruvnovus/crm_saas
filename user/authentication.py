@@ -17,9 +17,13 @@ class TenantAwareTokenAuthentication(TokenAuthentication):
         try:
             token = Token.objects.select_related('user').get(key=key)
             user = token.user
-            # If user has tenant, set tenant context
-            if hasattr(user, 'tenant') and user.tenant:
+            # Only set tenant context if user is NOT a tenant admin
+            # Tenant admins live in main database and should always be queried from there
+            if hasattr(user, 'tenant') and user.tenant and not getattr(user, 'is_tenant_admin', False):
                 connections['default'].tenant = user.tenant
+            else:
+                # Tenant admin or user without tenant: ensure we're in main database
+                connections['default'].tenant = None
             return (user, token)
         except Token.DoesNotExist:
             pass

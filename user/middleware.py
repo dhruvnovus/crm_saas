@@ -34,10 +34,14 @@ class TenantMiddleware:
             response = self.get_response(request)
             
             # After authentication, try to get tenant from user if not already set
+            # BUT: Tenant admins live in main database and should not have tenant context set
             if hasattr(request, 'user') and request.user.is_authenticated and not request.tenant:
                 if hasattr(request.user, 'tenant') and request.user.tenant:
-                    request.tenant = request.user.tenant
-                    connections['default'].tenant = request.user.tenant
+                    # Only set tenant context if user is NOT a tenawt admin
+                    # Tenant admins are stored in main database and queries should go there
+                    if not getattr(request.user, 'is_tenant_admin', False):
+                        request.tenant = request.user.tenant
+                        connections['default'].tenant = request.user.tenant
             
             return response
         finally:
