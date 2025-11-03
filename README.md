@@ -152,6 +152,7 @@ python manage.py runserver
 - `GET /api/customers/<uuid>/` - Retrieve a customer
 - `PATCH /api/customers/<uuid>/` - Update a customer
 - `DELETE /api/customers/<uuid>/` - Soft delete a customer
+- `POST /api/customers/import/` - Import customers via CSV/XLSX (multipart `file`)
 
 ### Lead Endpoints
 - `GET /api/leads/` - List leads (paginated)
@@ -160,6 +161,7 @@ python manage.py runserver
 - `PATCH /api/leads/<uuid>/` - Update a lead
 - `DELETE /api/leads/<uuid>/` - Soft delete a lead
 - `PATCH /api/leads/<uuid>/status/` - Update lead status only
+- `POST /api/leads/import/` - Import leads via CSV/XLSX (multipart `file`)
 
 ### Tenant Management
 - `GET /api/auth/tenants/` - List tenants
@@ -249,6 +251,16 @@ curl -X POST http://localhost:8000/api/customers/ \
   }'
 ```
 
+### Import Customers (CSV/XLSX)
+```bash
+curl -X POST http://localhost:8000/api/customers/import/ \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "X-Tenant: tenant_name" \
+  -F "file=@customers_sample.csv"
+```
+Accepted columns (case-insensitive): `name,email,phone,company,address,city,state,country,zip_code,is_active`
+
+
 ### List Leads (paginated)
 ```bash
 curl -X GET "http://localhost:8000/api/leads/?page=1&page_size=20" \
@@ -268,6 +280,19 @@ curl -X POST http://localhost:8000/api/leads/ \
     "customer_email": "contact@acme.com"
   }'
 ```
+
+### Import Leads (CSV/XLSX)
+```bash
+curl -X POST http://localhost:8000/api/leads/import/ \
+  -H "Authorization: Token YOUR_TOKEN_HERE" \
+  -H "X-Tenant: tenant_name" \
+  -F "file=@leads_sample.csv"
+```
+Accepted columns (case-insensitive): `name,email,phone,status,source,notes,customer_email,customer_name,is_active`
+Notes:
+- For customers import, rows without `email` are skipped.
+- For leads import, `customer_email` will link existing customer in the same tenant or create one if not found.
+- Boolean `is_active` accepts true/false/1/0/yes/no.
 
 ### Update Lead Status Only
 ```bash

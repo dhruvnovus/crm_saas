@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from .models import Lead, LeadStatus
 from customer.models import Customer
+from customer.serializers import CustomerSerializer
 
 
 class LeadSerializer(serializers.ModelSerializer):
@@ -17,11 +18,13 @@ class LeadSerializer(serializers.ModelSerializer):
     )
     customer_email = serializers.EmailField(required=False, allow_null=True, write_only=True)
     customer_name = serializers.CharField(required=False, allow_blank=True, allow_null=True, write_only=True)
+    # Expose full customer details in read responses
+    customer_details = CustomerSerializer(source='customer', read_only=True)
     
     class Meta:
         model = Lead
         fields = [
-            'id', 'customer', 'customer_email', 'customer_name', 'name', 'email',
+            'id', 'customer', 'customer_email', 'customer_name', 'customer_details', 'name', 'email',
             'phone', 'status', 'source', 'notes', 'is_active', 'created_at',
             'updated_at'
         ]

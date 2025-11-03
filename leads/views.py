@@ -1,4 +1,6 @@
 from rest_framework import status, generics, filters
+from rest_framework.views import APIView
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
@@ -10,6 +12,7 @@ from .models import Lead
 from customer.models import Customer
 from .serializers import LeadSerializer, LeadStatusUpdateSerializer
 from user.models import CustomUser
+from .importer import detect_and_parse_tabular, normalize_lead_row
 
 
 @method_decorator(
@@ -75,7 +78,11 @@ class LeadListCreateView(generics.ListCreateAPIView):
         from django.db import connections
         connections['default'].tenant = self.request.user.tenant
         # Default ordering: newest first
-        return Lead.objects.filter(tenant=self.request.user.tenant, is_active=True).order_by('-created_at')
+        return (
+            Lead.objects.filter(tenant=self.request.user.tenant, is_active=True)
+            .select_related('customer')
+            .order_by('-created_at')
+        )
 
     
     def create(self, request, *args, **kwargs):
@@ -204,7 +211,7 @@ class LeadDetailView(generics.RetrieveUpdateDestroyAPIView):
             return Lead.objects.none()
         from django.db import connections
         connections['default'].tenant = self.request.user.tenant
-        return Lead.objects.filter(tenant=self.request.user.tenant, is_active=True)
+        return Lead.objects.filter(tenant=self.request.user.tenant, is_active=True).select_related('customer')
 
     def perform_update(self, serializer):
         if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
@@ -272,4 +279,143 @@ class LeadStatusUpdateView(generics.UpdateAPIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(LeadSerializer(instance, context={'request': request}).data, status=status.HTTP_200_OK)
+
+
+@method_decorator(
+    name='post',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='Import leads via CSV or Excel (.xlsx). By default links existing customer by email or auto-creates if missing. Disable creation with ?auto_create_customer=false',
+        manual_parameters=[
+            openapi.Parameter(
+                'file', openapi.IN_FORM, description='CSV or XLSX file', type=openapi.TYPE_FILE, required=True
+            ),
+            openapi.Parameter(
+                'auto_create_customer', openapi.IN_QUERY, description='If true (default), create customer when not found by email', type=openapi.TYPE_BOOLEAN, required=False
+            ),
+        ],
+        responses={
+            200: openapi.Response(
+                description='Import summary',
+                examples={
+                    'application/json': {
+                        'processed': 10,
+                        'created': 8,
+                        'updated': 0,
+                        'skipped': 2,
+                        'errors': [
+                            {'row': 3, 'error': 'name is required'}
+                        ],
+                    }
+                },
+            )
+        },
+    ),
+)
+class LeadImportView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, *args, **kwargs):
+        if not request.user or not request.user.is_authenticated:
+            return Response({'detail': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+        if not getattr(request.user, 'tenant', None):
+            return Response({'detail': 'No tenant associated'}, status=status.HTTP_400_BAD_REQUEST)
+
+        file_obj = request.FILES.get('file')
+        if not file_obj:
+            return Response({'detail': 'file is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.db import connections
+        connections['default'].tenant = request.user.tenant
+
+        tenant_user = CustomUser.objects.filter(id=request.user.id).first()
+        if not tenant_user:
+            tenant_user = CustomUser.objects.create(
+                id=request.user.id,
+                username=request.user.username,
+                email=request.user.email,
+                first_name=request.user.first_name,
+                last_name=request.user.last_name,
+                is_active=request.user.is_active,
+                is_staff=request.user.is_staff,
+                is_superuser=request.user.is_superuser,
+                password=request.user.password,
+                tenant=request.user.tenant,
+            )
+
+        try:
+            rows, _fmt = detect_and_parse_tabular(file_obj, file_obj.name)
+        except Exception as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        auto_create_param = str(request.query_params.get('auto_create_customer', 'true')).strip().lower()
+        auto_create_customer = auto_create_param not in ('false', '0', 'no')
+
+        processed = created = updated = skipped = 0
+        errors = []
+        for idx, raw in enumerate(rows, start=2):
+            processed += 1
+            data = normalize_lead_row(raw)
+            name = (data.get('name') or '') if data else ''
+            if not name:
+                skipped += 1
+                errors.append({'row': idx, 'error': 'name is required'})
+                continue
+            try:
+                # Optional link/create customer by email
+                customer = None
+                cust_email = (data.get('customer_email') or '').strip() if data.get('customer_email') else ''
+                cust_name = (data.get('customer_name') or '').strip() if data.get('customer_name') else ''
+                if cust_email:
+                    try:
+                        # Try to link any existing customer by email (regardless of active flag)
+                        customer = Customer.objects.get(
+                            tenant=request.user.tenant, email=cust_email
+                        )
+                        # Optionally re-activate if auto-create is on and record is inactive
+                        if auto_create_customer and customer.is_active is False:
+                            customer.is_active = True
+                            customer.save(update_fields=['is_active'])
+                    except Customer.DoesNotExist:
+                        if auto_create_customer:
+                            # Auto-create minimal customer when enabled
+                            customer = Customer.objects.create(
+                                tenant=request.user.tenant,
+                                created_by=tenant_user,
+                                name=(cust_name or cust_email.split('@')[0]),
+                                email=cust_email,
+                                is_active=True,
+                            )
+                        else:
+                            customer = None
+
+                lead = Lead(
+                    tenant=request.user.tenant,
+                    created_by=tenant_user,
+                    customer=customer,
+                    name=name,
+                    email=data.get('email'),
+                    phone=data.get('phone'),
+                    status=data.get('status') or 'new',
+                    source=data.get('source'),
+                    notes=data.get('notes'),
+                    is_active=data.get('is_active', True),
+                )
+                lead.save()
+                created += 1
+            except Exception as exc:
+                skipped += 1
+                errors.append({'row': idx, 'error': str(exc)})
+
+        return Response(
+            {
+                'processed': processed,
+                'created': created,
+                'updated': updated,
+                'skipped': skipped,
+                'errors': errors,
+            },
+            status=status.HTTP_200_OK,
+        )
 
