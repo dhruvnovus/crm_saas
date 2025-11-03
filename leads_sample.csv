@@ -1,0 +1,5 @@
+name,email,phone,status,source,notes,customer_email,customer_name,is_active
+Product Inquiry,,+1-415-555-7701,new,Website,"Asked about integration details",emma@novacorp.io,Emma Davis,true
+Trial Signup,trial.user@example.com,+1-206-555-7702,contacted,Email,"Requested 14-day trial",frank@bluepine.com,Frank Miller,true
+Conference Lead,conf.lead@example.org,,qualified,Event,"Met at TechConf London",grace@orbital.tech,Grace Lee,true
+Support Question,,+61-2-5550-7704,new,Support,"Pre-sales support question",henry12@motorlabs.au,Henry Ford,true

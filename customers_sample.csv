@@ -1,0 +1,5 @@
+name,email,phone,company,address,city,state,country,zip_code,is_active
+Emma Davis,emma@novacorp.io,+1-415-555-1100,NovaCorp,101 First Ave,San Jose,CA,USA,95112,true
+Frank Miller,frank@bluepine.com,+1-206-555-2200,Blue Pine Co,220 Lakeview Dr,Seattle,WA,USA,98101,true
+Grace Lee,grace@orbital.tech,+44-20-5550-3300,Orbital Tech,55 Canary Wharf,London,,UK,E14 5AB,true
+Henry Ford,henry@motorlabs.au,+61-2-5550-4400,MotorLabs,77 Harbour Rd,Sydney,NSW,Australia,2000,false
