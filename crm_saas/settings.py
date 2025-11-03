@@ -102,6 +102,8 @@ DATABASES = {
         'ENGINE': os.getenv('DB_ENGINE', 'django.db.backends.mysql'),
         'NAME': os.getenv('DB_NAME', 'crm_saas_main'),
         'USER': os.getenv('DB_USER', 'root'),
+        # 'PASSWORD': os.getenv('DB_PASSWORD', ''),
+        # 'HOST': os.getenv('DB_HOST', '127.0.0.1'),
         'PASSWORD': os.getenv('DB_PASSWORD', 'Novuscode123'),
         'HOST': os.getenv('DB_HOST', 'all-database.cgn118uneswh.us-east-2.rds.amazonaws.com'),
         'PORT': os.getenv('DB_PORT', '3306'),
@@ -142,6 +144,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
