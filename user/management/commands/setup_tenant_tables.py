@@ -125,7 +125,8 @@ class Command(BaseCommand):
                     'auth_group_permissions', 'django_migrations', 'django_session',
                     'django_admin_log', 'user_customuser', 'user_tenantuser', 
                     'user_history', 'auth_user_groups', 'auth_user_user_permissions', 
-                    'authtoken_token', 'customer_customer', 'leads_lead'
+                    'authtoken_token', 'customer_customer', 'customer_customerhistory', 
+                    'leads_lead', 'leads_leadhistory'
                 ]
                 missing_tables = [table for table in required_tables if table not in existing_tables]
                 if not missing_tables:
@@ -174,7 +175,9 @@ class Command(BaseCommand):
                 'auth_user_user_permissions',
                 'authtoken_token',
                 'customer_customer',
-                'leads_lead'
+                'customer_customerhistory',
+                'leads_lead',
+                'leads_leadhistory'
             ]
             
             # Create each required table
@@ -252,6 +255,56 @@ class Command(BaseCommand):
                         """
                         cursor.execute(create_sql)
                         self.stdout.write('Created table: leads_lead (explicit)')
+                    elif table_name == 'customer_customerhistory':
+                        # Create customer history table with FKs to customer_customer, tenant, and user_customuser
+                        create_sql = """
+                            CREATE TABLE IF NOT EXISTS `customer_customerhistory` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `customer_id` char(32) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `changed_by_id` bigint NULL,
+                                `action` varchar(20) NOT NULL,
+                                `field_name` varchar(100) NULL,
+                                `old_value` longtext NULL,
+                                `new_value` longtext NULL,
+                                `changes` json NULL,
+                                `notes` longtext NULL,
+                                KEY `customer_cu_custome_cb020b_idx` (`customer_id`, `created_at`),
+                                KEY `customer_cu_tenant__33f174_idx` (`tenant_id`, `created_at`),
+                                KEY `customer_cu_action_7efb1a_idx` (`action`, `created_at`),
+                                CONSTRAINT `customerhistory_customer_fk` FOREIGN KEY (`customer_id`) REFERENCES `customer_customer` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+                                CONSTRAINT `customerhistory_changed_by_fk` FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: customer_customerhistory (explicit)')
+                    elif table_name == 'leads_leadhistory':
+                        # Create lead history table with FKs to leads_lead, tenant, and user_customuser
+                        create_sql = """
+                            CREATE TABLE IF NOT EXISTS `leads_leadhistory` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `lead_id` char(32) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `changed_by_id` bigint NULL,
+                                `action` varchar(20) NOT NULL,
+                                `field_name` varchar(100) NULL,
+                                `old_value` longtext NULL,
+                                `new_value` longtext NULL,
+                                `changes` json NULL,
+                                `notes` longtext NULL,
+                                KEY `leads_leadh_lead_id_0512de_idx` (`lead_id`, `created_at`),
+                                KEY `leads_leadh_tenant__086cc8_idx` (`tenant_id`, `created_at`),
+                                KEY `leads_leadh_action_5746c6_idx` (`action`, `created_at`),
+                                CONSTRAINT `leadhistory_lead_fk` FOREIGN KEY (`lead_id`) REFERENCES `leads_lead` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+                                CONSTRAINT `leadhistory_changed_by_fk` FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: leads_leadhistory (explicit)')
                     else:
                         self.stdout.write(f'Warning: Table {table_name} not found in main database')
             
@@ -264,6 +317,8 @@ class Command(BaseCommand):
             self.ensure_customer_columns(cursor)
             # Ensure leads table FKs are relaxed if any
             self.fix_leads_table(cursor)
+            # Fix history tables to remove tenant foreign key constraints
+            self.fix_history_tables(cursor)
             
             # Re-enable foreign key checks
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
@@ -309,7 +364,8 @@ class Command(BaseCommand):
                 'auth_group_permissions', 'django_migrations', 'django_session',
                 'django_admin_log', 'user_customuser', 'user_tenantuser', 
                 'user_history', 'auth_user_groups', 'auth_user_user_permissions', 
-                'authtoken_token', 'customer_customer', 'leads_lead'
+                'authtoken_token', 'customer_customer', 'customer_customerhistory',
+                'leads_lead', 'leads_leadhistory'
             ]
             
             missing_tables = [table for table in required_tables if table not in tables]
@@ -331,6 +387,10 @@ class Command(BaseCommand):
                 connection.close()
                 main_cursor.close()
                 main_connection.close()
+                
+                # Mark migrations as fake-applied to avoid conflicts when running migrate commands
+                self.mark_migrations_as_applied(database_name)
+                
                 return True
 
         except Exception as e:
@@ -459,6 +519,47 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(f'Warning: Could not fix leads_lead table: {str(e)}')
 
+    def fix_history_tables(self, cursor):
+        """Fix history tables FK constraints to remove tenant foreign key constraints"""
+        try:
+            def drop_foreign_keys(table_name, column_name):
+                cursor.execute("""
+                    SELECT CONSTRAINT_NAME
+                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                      AND COLUMN_NAME = %s
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+                """, (table_name, column_name))
+                constraints = [row[0] for row in cursor.fetchall()]
+                for constraint in constraints:
+                    self.stdout.write(f"Dropping foreign key {constraint} on {table_name}.{column_name}")
+                    cursor.execute(f"ALTER TABLE `{table_name}` DROP FOREIGN KEY `{constraint}`")
+
+            # Fix customer_customerhistory table
+            cursor.execute("SHOW TABLES LIKE 'customer_customerhistory'")
+            if cursor.fetchone():
+                # Only relax tenant_id; keep customer_id and changed_by_id foreign keys
+                drop_foreign_keys('customer_customerhistory', 'tenant_id')
+                try:
+                    cursor.execute("ALTER TABLE customer_customerhistory MODIFY COLUMN tenant_id char(32) NULL")
+                except Exception:
+                    pass
+                self.stdout.write('Checked and fixed FKs for customer_customerhistory (kept customer_id, changed_by_id)')
+
+            # Fix leads_leadhistory table
+            cursor.execute("SHOW TABLES LIKE 'leads_leadhistory'")
+            if cursor.fetchone():
+                # Only relax tenant_id; keep lead_id and changed_by_id foreign keys
+                drop_foreign_keys('leads_leadhistory', 'tenant_id')
+                try:
+                    cursor.execute("ALTER TABLE leads_leadhistory MODIFY COLUMN tenant_id char(32) NULL")
+                except Exception:
+                    pass
+                self.stdout.write('Checked and fixed FKs for leads_leadhistory (kept lead_id, changed_by_id)')
+        except Exception as e:
+            self.stdout.write(f'Warning: Could not fix history tables: {str(e)}')
+
     def fix_all_tenant_foreign_keys(self):
         """Fix foreign key constraints in all tenant databases"""
         tenants = Tenant.objects.filter(is_active=True)
@@ -501,6 +602,8 @@ class Command(BaseCommand):
             self.fix_user_customuser_table(cursor)
             self.ensure_customer_columns(cursor)
             self.fix_leads_table(cursor)
+            # Fix history tables
+            self.fix_history_tables(cursor)
             
             # Re-enable foreign key checks
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
@@ -566,3 +669,86 @@ class Command(BaseCommand):
                     cursor.execute(f"ALTER TABLE customer_customer ADD COLUMN {col_name} {col_def}")
         except Exception as e:
             self.stdout.write(f'Warning: Could not ensure customer columns: {str(e)}')
+
+    def mark_migrations_as_applied(self, database_name):
+        """Mark all existing migrations as fake-applied to avoid conflicts"""
+        try:
+            # Ensure the tenant database is registered with Django connections
+            if database_name not in connections.databases:
+                connections.databases[database_name] = {
+                    'ENGINE': 'django.db.backends.mysql',
+                    'NAME': database_name,
+                    'USER': settings.DATABASES['default']['USER'],
+                    'PASSWORD': settings.DATABASES['default']['PASSWORD'],
+                    'HOST': settings.DATABASES['default']['HOST'],
+                    'PORT': settings.DATABASES['default']['PORT'],
+                    'OPTIONS': {
+                        'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+                    },
+                }
+            
+            self.stdout.write(f'Marking migrations as applied for {database_name}...')
+            
+            # Use fake_initial=True to mark existing migrations as applied
+            # This prevents migration errors when tables already exist
+            call_command('migrate', database=database_name, fake_initial=True, verbosity=0)
+            
+            # Also fake-apply customer.0002 and customer.0003 since we created those columns/tables explicitly
+            # Check if customer.0002 columns already exist
+            connection = mysql.connector.connect(
+                host=settings.DATABASES['default']['HOST'],
+                user=settings.DATABASES['default']['USER'],
+                password=settings.DATABASES['default']['PASSWORD'],
+                port=settings.DATABASES['default']['PORT'],
+                database=database_name
+            )
+            cursor = connection.cursor()
+            
+            # Check if customer table has the columns from 0002
+            cursor.execute("""
+                SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = %s
+                  AND TABLE_NAME = 'customer_customer'
+                  AND COLUMN_NAME IN ('address', 'city', 'state', 'country', 'zip_code', 'is_active')
+            """, (database_name,))
+            column_count = cursor.fetchone()[0]
+            
+            if column_count >= 6:
+                # All columns from 0002 exist, fake the migration
+                try:
+                    call_command('migrate', 'customer', '0002_customer_address_customer_city_customer_country_and_more', 
+                                database=database_name, fake=True, verbosity=0)
+                    self.stdout.write('✓ Faked customer.0002 migration (columns already exist)')
+                except Exception:
+                    pass
+            
+            # Check if customer_customerhistory table exists
+            cursor.execute("SHOW TABLES LIKE 'customer_customerhistory'")
+            if cursor.fetchone():
+                # Table exists, fake the migration
+                try:
+                    call_command('migrate', 'customer', '0003_customerhistory', 
+                                database=database_name, fake=True, verbosity=0)
+                    self.stdout.write('✓ Faked customer.0003 migration (table already exists)')
+                except Exception:
+                    pass
+            
+            # Check if leads_leadhistory table exists
+            cursor.execute("SHOW TABLES LIKE 'leads_leadhistory'")
+            if cursor.fetchone():
+                # Table exists, fake the migration
+                try:
+                    call_command('migrate', 'leads', '0002_leadhistory', 
+                                database=database_name, fake=True, verbosity=0)
+                    self.stdout.write('✓ Faked leads.0002 migration (table already exists)')
+                except Exception:
+                    pass
+            
+            cursor.close()
+            connection.close()
+            
+            self.stdout.write('✓ Successfully marked migrations as applied')
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f'Warning: Could not mark migrations as applied: {str(e)}')
+            )

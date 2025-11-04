@@ -8,9 +8,10 @@ from drf_yasg import openapi
 from django.utils.decorators import method_decorator
  
 
-from .models import Lead
+from .models import Lead, LeadHistory
 from customer.models import Customer
 from .serializers import LeadSerializer, LeadStatusUpdateSerializer
+from .history_serializers import LeadHistorySerializer
 from user.models import CustomUser
 from .importer import detect_and_parse_tabular, normalize_lead_row
 
@@ -142,6 +143,8 @@ class LeadListCreateView(generics.ListCreateAPIView):
             customer=customer,
             **validated,
         )
+        # Attach user for history tracking
+        lead._changed_by = tenant_user
         lead.save()
         return Response(LeadSerializer(lead, context={'request': request}).data, status=status.HTTP_201_CREATED)
 
@@ -219,6 +222,10 @@ class LeadDetailView(generics.RetrieveUpdateDestroyAPIView):
             raise ValidationError({'detail': 'No tenant associated with user'})
         from django.db import connections
         connections['default'].tenant = self.request.user.tenant
+        # Get tenant user for history tracking
+        tenant_user = CustomUser.objects.filter(id=self.request.user.id).first()
+        instance = serializer.instance
+        instance._changed_by = tenant_user
         serializer.save()
 
     def delete(self, request, *args, **kwargs):
@@ -227,8 +234,12 @@ class LeadDetailView(generics.RetrieveUpdateDestroyAPIView):
         instance = self.get_object()
         from django.db import connections
         connections['default'].tenant = request.user.tenant
+        # Get tenant user for history tracking
+        tenant_user = CustomUser.objects.filter(id=request.user.id).first()
         instance.is_active = False
+        instance._changed_by = tenant_user
         instance.save(update_fields=['is_active', 'updated_at'])
+        # History will be tracked by the signal
         return Response({'message': 'Lead soft-deleted'}, status=status.HTTP_200_OK)
 
 
@@ -277,6 +288,9 @@ class LeadStatusUpdateView(generics.UpdateAPIView):
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        # Get tenant user for history tracking
+        tenant_user = CustomUser.objects.filter(id=request.user.id).first()
+        instance._changed_by = tenant_user
         serializer.save()
         return Response(LeadSerializer(instance, context={'request': request}).data, status=status.HTTP_200_OK)
 
@@ -402,6 +416,8 @@ class LeadImportView(APIView):
                     notes=data.get('notes'),
                     is_active=data.get('is_active', True),
                 )
+                # Attach user for history tracking
+                lead._changed_by = tenant_user
                 lead.save()
                 created += 1
             except Exception as exc:
@@ -418,4 +434,77 @@ class LeadImportView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='Get history of all changes for a specific lead by ID',
+        responses={
+            200: openapi.Response(
+                description='Lead history retrieved successfully',
+                examples={
+                    'application/json': {
+                        'count': 2,
+                        'next': None,
+                        'previous': None,
+                        'results': [
+                            {
+                                'id': 'uuid-here',
+                                'action': 'created',
+                                'field_name': None,
+                                'old_value': None,
+                                'new_value': None,
+                                'changes': {'all_fields': 'Lead created'},
+                                'notes': 'Lead was created',
+                                'changed_by_username': 'john.doe',
+                                'changed_by_email': 'john@example.com',
+                                'created_at': '2024-01-01T12:00:00Z',
+                            },
+                            {
+                                'id': 'uuid-here',
+                                'action': 'status_changed',
+                                'field_name': 'status',
+                                'old_value': 'new',
+                                'new_value': 'contacted',
+                                'changes': {'status': {'old': 'new', 'new': 'contacted'}},
+                                'notes': 'Status changed from new to contacted',
+                                'changed_by_username': 'john.doe',
+                                'changed_by_email': 'john@example.com',
+                                'created_at': '2024-01-02T12:00:00Z',
+                            },
+                        ],
+                    }
+                },
+            ),
+            404: openapi.Response(description='Lead not found'),
+        },
+    ),
+)
+class LeadHistoryView(generics.ListAPIView):
+    """API endpoint to retrieve history of changes for a specific lead"""
+    permission_classes = [IsAuthenticated]
+    serializer_class = LeadHistorySerializer
+    lookup_field = 'pk'
+
+    def get_queryset(self):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            return LeadHistory.objects.none()
+        
+        from django.db import connections
+        connections['default'].tenant = self.request.user.tenant
+        
+        lead_id = self.kwargs.get('pk')
+        
+        # Verify lead exists and belongs to tenant
+        try:
+            lead = Lead.objects.get(id=lead_id, tenant=self.request.user.tenant)
+        except Lead.DoesNotExist:
+            return LeadHistory.objects.none()
+        
+        return LeadHistory.objects.filter(
+            lead=lead,
+            tenant=self.request.user.tenant
+        ).select_related('changed_by').order_by('-created_at')
 

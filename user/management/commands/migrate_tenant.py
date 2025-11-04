@@ -34,6 +34,11 @@ class Command(BaseCommand):
                 'OPTIONS': {
                     'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
                 },
+                'ATOMIC_REQUESTS': False,
+                'AUTOCOMMIT': True,
+                'CONN_HEALTH_CHECKS': False,
+                'CONN_MAX_AGE': 0,
+                'TIME_ZONE': None,
             }
             
             # Add tenant database to connections
@@ -62,6 +67,10 @@ class Command(BaseCommand):
             self.stdout.write(f"Running migrations for tenant database: {database_name}")
             from django.core.management import call_command
             
+            # Use fake_initial=True to handle tables created by setup_tenant_tables
+            # This will mark existing migrations as applied without recreating tables
+            call_command('migrate', database=database_name, fake_initial=True, verbosity=1)
+            # Then apply any new migrations that don't exist yet
             call_command('migrate', database=database_name, verbosity=1)
             self.stdout.write(self.style.SUCCESS(f"Successfully migrated tenant database: {database_name}"))
             

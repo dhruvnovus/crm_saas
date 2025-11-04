@@ -6,3 +6,6 @@ class LeadsConfig(AppConfig):
     name = 'leads'
     verbose_name = 'Leads'
 
+    def ready(self):
+        import leads.signals  # noqa
+

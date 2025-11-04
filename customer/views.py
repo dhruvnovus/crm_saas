@@ -6,9 +6,10 @@ from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from django.utils.decorators import method_decorator
-from .models import Customer
+from .models import Customer, CustomerHistory
 from user.models import CustomUser
 from .serializers import CustomerSerializer
+from .history_serializers import CustomerHistorySerializer
 from .importer import detect_and_parse_tabular, normalize_customer_row
 
 
@@ -111,6 +112,8 @@ class CustomerListCreateView(generics.ListCreateAPIView):
             created_by=request.user,
             **serializer.validated_data,
         )
+        # Attach user for history tracking
+        customer._changed_by = request.user
         customer.save()
         return Response(CustomerSerializer(customer).data, status=status.HTTP_201_CREATED)
 
@@ -185,14 +188,22 @@ class CustomerDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_update(self, serializer):
         from django.db import connections
         connections['default'].tenant = self.request.user.tenant
+        # Get tenant user for history tracking
+        tenant_user = CustomUser.objects.filter(id=self.request.user.id).first()
+        instance = serializer.instance
+        instance._changed_by = tenant_user if tenant_user else self.request.user
         serializer.save()
 
     def delete(self, request, *args, **kwargs):
         instance = self.get_object()
         from django.db import connections
         connections['default'].tenant = self.request.user.tenant
+        # Get tenant user for history tracking
+        tenant_user = CustomUser.objects.filter(id=request.user.id).first()
         instance.is_active = False
+        instance._changed_by = tenant_user if tenant_user else request.user
         instance.save(update_fields=['is_active', 'updated_at'])
+        # History will be tracked by the signal
         return Response({'message': 'Customer soft-deleted'}, status=status.HTTP_200_OK)
 
 
@@ -293,10 +304,13 @@ class CustomerImportView(APIView):
                     email=email,
                     defaults=defaults,
                 )
+                # Attach user for history tracking
+                obj._changed_by = tenant_user
                 if created_flag:
                     created += 1
                 else:
                     updated += 1
+                obj.save()
             except Exception as exc:
                 skipped += 1
                 errors.append({'row': idx, 'error': str(exc)})
@@ -311,3 +325,79 @@ class CustomerImportView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        operation_description='Get history of all changes for a specific customer by ID',
+        responses={
+            200: openapi.Response(
+                description='Customer history retrieved successfully',
+                examples={
+                    'application/json': {
+                        'count': 2,
+                        'next': None,
+                        'previous': None,
+                        'results': [
+                            {
+                                'id': 'uuid-here',
+                                'action': 'created',
+                                'field_name': None,
+                                'old_value': None,
+                                'new_value': None,
+                                'changes': {'all_fields': 'Customer created'},
+                                'notes': 'Customer was created',
+                                'changed_by_username': 'john.doe',
+                                'changed_by_email': 'john@example.com',
+                                'created_at': '2024-01-01T12:00:00Z',
+                            },
+                            {
+                                'id': 'uuid-here',
+                                'action': 'updated',
+                                'field_name': 'name, phone',
+                                'old_value': None,
+                                'new_value': None,
+                                'changes': {
+                                    'name': {'old': 'Old Name', 'new': 'New Name'},
+                                    'phone': {'old': '123', 'new': '456'}
+                                },
+                                'notes': 'Updated fields: name, phone',
+                                'changed_by_username': 'john.doe',
+                                'changed_by_email': 'john@example.com',
+                                'created_at': '2024-01-02T12:00:00Z',
+                            },
+                        ],
+                    }
+                },
+            ),
+            404: openapi.Response(description='Customer not found'),
+        },
+    ),
+)
+class CustomerHistoryView(generics.ListAPIView):
+    """API endpoint to retrieve history of changes for a specific customer"""
+    permission_classes = [IsAuthenticated]
+    serializer_class = CustomerHistorySerializer
+    lookup_field = 'pk'
+
+    def get_queryset(self):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            return CustomerHistory.objects.none()
+        
+        from django.db import connections
+        connections['default'].tenant = self.request.user.tenant
+        
+        customer_id = self.kwargs.get('pk')
+        
+        # Verify customer exists and belongs to tenant
+        try:
+            customer = Customer.objects.get(id=customer_id, tenant=self.request.user.tenant)
+        except Customer.DoesNotExist:
+            return CustomerHistory.objects.none()
+        
+        return CustomerHistory.objects.filter(
+            customer=customer,
+            tenant=self.request.user.tenant
+        ).select_related('changed_by').order_by('-created_at')
