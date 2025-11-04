@@ -18,7 +18,7 @@ class LeadSerializer(serializers.ModelSerializer):
     )
     customer_email = serializers.EmailField(required=False, allow_null=True, write_only=True)
     customer_name = serializers.CharField(required=False, allow_blank=True, allow_null=True, write_only=True)
-    # Expose full customer details in read responses
+    # Expose full customer details in GET responses only (read-only)
     customer_details = CustomerSerializer(source='customer', read_only=True)
     
     class Meta:
@@ -50,6 +50,10 @@ class LeadSerializer(serializers.ModelSerializer):
                     tenant=request.user.tenant,
                     is_active=True
                 )
+        
+        # Exclude customer_details from POST/PATCH requests, only include in GET responses
+        if request and request.method in ('POST', 'PATCH', 'PUT'):
+            self.fields.pop('customer_details', None)
 
     def validate(self, attrs):
         # If both customer and customer_email are missing, that's fine (lead can be unlinked)

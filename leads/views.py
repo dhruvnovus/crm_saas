@@ -255,7 +255,7 @@ class LeadDetailView(generics.RetrieveUpdateDestroyAPIView):
                     'application/json': {
                         'id': 'uuid-here',
                         'name': 'Website Inquiry',
-                        'status': 'closed',
+                        'status': 'interested',
                         'customer': 'uuid-of-customer',
                         'is_active': True,
                     }
@@ -467,9 +467,9 @@ class LeadImportView(APIView):
                                 'action': 'status_changed',
                                 'field_name': 'status',
                                 'old_value': 'new',
-                                'new_value': 'contacted',
-                                'changes': {'status': {'old': 'new', 'new': 'contacted'}},
-                                'notes': 'Status changed from new to contacted',
+                                'new_value': 'open',
+                                'changes': {'status': {'old': 'new', 'new': 'open'}},
+                                'notes': 'Status changed from new to open',
                                 'changed_by_username': 'john.doe',
                                 'changed_by_email': 'john@example.com',
                                 'created_at': '2024-01-02T12:00:00Z',

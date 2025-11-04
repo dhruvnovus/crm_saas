@@ -8,9 +8,9 @@ from customer.models import Customer
 class LeadStatus(models.TextChoices):
     NEW = 'new', 'New'
     CONTACTED = 'contacted', 'Contacted'
-    QUALIFIED = 'qualified', 'Qualified'
-    WON = 'won', 'Won'
-    LOST = 'lost', 'Lost'
+    OPEN = 'open', 'Open'
+    INTERESTED = 'interested', 'Interested'
+    NOT_INTERESTED = 'not_interested', 'Not Interested'
 
 
 class Lead(TimestampedModel):

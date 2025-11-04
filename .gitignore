@@ -144,6 +144,7 @@ ENV/
 env.bak/
 venv.bak/
 .DS_Store
+.cursor/
 
 # Spyder project settings
 .spyderproject
