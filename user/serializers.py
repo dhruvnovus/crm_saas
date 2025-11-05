@@ -426,14 +426,17 @@ class ChangePasswordSerializer(serializers.Serializer):
         original_tenant = getattr(connections['default'], 'tenant', None)
         try:
             # Route to the DB where the user record lives
-            if hasattr(user, 'tenant') and user.tenant:
+            # Tenant admins are stored in the main database even if they have a tenant relation
+            if getattr(user, 'is_tenant_admin', False):
+                setattr(connections['default'], 'tenant', None)
+            elif hasattr(user, 'tenant') and user.tenant:
                 setattr(connections['default'], 'tenant', user.tenant)
             else:
                 setattr(connections['default'], 'tenant', None)
 
             user.set_password(new_password)
-            # Avoid update_fields to prevent 0-rows-updated with cross-DB contexts
-            user.save()
+            # Persist only the password field
+            user.save(update_fields=['password'])
             return user
         finally:
             setattr(connections['default'], 'tenant', original_tenant)
