@@ -8,9 +8,9 @@ from drf_yasg import openapi
 from django.utils.decorators import method_decorator
  
 
-from .models import Lead, LeadHistory
+from .models import Lead, LeadHistory, LeadCallSummary
 from customer.models import Customer
-from .serializers import LeadSerializer, LeadStatusUpdateSerializer
+from .serializers import LeadSerializer, LeadStatusUpdateSerializer, LeadCallSummarySerializer
 from .history_serializers import LeadHistorySerializer
 from user.models import CustomUser
 from .importer import detect_and_parse_tabular, normalize_lead_row
@@ -508,3 +508,268 @@ class LeadHistoryView(generics.ListAPIView):
             tenant=self.request.user.tenant
         ).select_related('changed_by').order_by('-created_at')
 
+
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='List call summaries for a lead',
+    ),
+)
+@method_decorator(
+    name='post',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='Create a call summary for a lead',
+    ),
+)
+class LeadCallSummaryListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = LeadCallSummarySerializer
+
+    def get_queryset(self):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            return LeadCallSummary.objects.none()
+        from django.db import connections
+        connections['default'].tenant = self.request.user.tenant
+        lead_id = self.kwargs.get('pk')
+        return LeadCallSummary.objects.filter(
+            tenant=self.request.user.tenant,
+            lead_id=lead_id,
+            is_active=True,
+        ).order_by('-created_at')
+
+    def perform_create(self, serializer):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'detail': 'No tenant associated with user'})
+        from django.db import connections
+        connections['default'].tenant = self.request.user.tenant
+        lead_id = self.kwargs.get('pk')
+        try:
+            lead = Lead.objects.get(id=lead_id, tenant=self.request.user.tenant, is_active=True)
+        except Lead.DoesNotExist:
+            from rest_framework.exceptions import NotFound
+            raise NotFound('Lead not found')
+        tenant_user = CustomUser.objects.filter(id=self.request.user.id).first()
+        # Save instance - signal will use created_by for history tracking on create
+        serializer.save(tenant=self.request.user.tenant, lead=lead, created_by=tenant_user)
+
+
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='Retrieve a call summary',
+    ),
+)
+@method_decorator(
+    name='patch',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='Update a call summary',
+    ),
+)
+@method_decorator(
+    name='delete',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='Soft delete a call summary',
+    ),
+)
+class LeadCallSummaryDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = LeadCallSummarySerializer
+    lookup_field = 'summary_id'
+    http_method_names = ['get', 'patch', 'delete']
+
+    def get_queryset(self):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            return LeadCallSummary.objects.none()
+        from django.db import connections
+        connections['default'].tenant = self.request.user.tenant
+        lead_id = self.kwargs.get('pk')
+        return LeadCallSummary.objects.filter(
+            tenant=self.request.user.tenant,
+            lead_id=lead_id,
+            is_active=True,
+        )
+
+    def get_object(self):
+        queryset = self.get_queryset()
+        obj = queryset.filter(id=self.kwargs.get('summary_id')).first()
+        if not obj:
+            from rest_framework.exceptions import NotFound
+            raise NotFound('Call summary not found')
+        return obj
+
+    def perform_update(self, serializer):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'detail': 'No tenant associated with user'})
+        from django.db import connections
+        connections['default'].tenant = self.request.user.tenant
+        # Get tenant user for history tracking
+        tenant_user = CustomUser.objects.filter(id=self.request.user.id).first()
+        instance = serializer.instance
+        instance._changed_by = tenant_user
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'detail': 'No tenant associated with user'})
+        from django.db import connections
+        connections['default'].tenant = self.request.user.tenant
+        # Get tenant user for history tracking
+        tenant_user = CustomUser.objects.filter(id=self.request.user.id).first()
+        instance._changed_by = tenant_user
+        instance.is_active = False
+        instance.save(update_fields=['is_active', 'updated_at'])
+
+
+@method_decorator(
+    name='post',
+    decorator=swagger_auto_schema(
+        tags=['Leads'],
+        operation_description='Create a call summary for a customer by customer ID. Automatically finds or creates a lead for the customer.',
+        request_body=LeadCallSummarySerializer,
+        responses={
+            201: openapi.Response(
+                description='Call summary created successfully',
+                schema=LeadCallSummarySerializer,
+            ),
+            400: openapi.Response(description='Validation error'),
+            404: openapi.Response(description='Customer not found'),
+        },
+    ),
+)
+class CustomerCallSummaryCreateView(APIView):
+    """Create a call summary for a customer by customer ID"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, customer_id):
+        if not hasattr(request.user, 'tenant') or not request.user.tenant:
+            return Response({'detail': 'No tenant associated with user'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        from django.db import connections
+        connections['default'].tenant = request.user.tenant
+        
+        # Get customer
+        try:
+            customer = Customer.objects.get(id=customer_id, tenant=request.user.tenant, is_active=True)
+        except Customer.DoesNotExist:
+            return Response({'detail': 'Customer not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Find existing lead for this customer (if exists, we'll update its status)
+        # Only create a new lead if none exists
+        lead = Lead.objects.filter(
+            tenant=request.user.tenant,
+            customer=customer,
+            is_active=True
+        ).order_by('-created_at').first()
+        
+        tenant_user = CustomUser.objects.filter(id=request.user.id).first()
+        
+        if not lead:
+            # No existing lead found, create a new one for this customer
+            lead = Lead.objects.create(
+                tenant=request.user.tenant,
+                customer=customer,
+                name=customer.name,
+                email=customer.email,
+                phone=customer.phone,
+                status='follow_up' if request.data.get('call_outcome') == 'follow_up' else 'new',
+                source='Call Summary',
+                created_by=tenant_user,
+                is_active=True
+            )
+            lead._changed_by = tenant_user
+            # History will be tracked by the lead_post_save signal
+        # If lead already exists, we'll update its status after creating the call summary
+        
+        # Create call summary using the existing serializer logic
+        serializer = LeadCallSummarySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        tenant_user = CustomUser.objects.filter(id=request.user.id).first()
+        call_summary = serializer.save(
+            tenant=request.user.tenant,
+            lead=lead,
+            created_by=tenant_user
+        )
+        
+        # Update lead status based on call summary answers
+        # If any question is answered "no" → not_interested
+        # If all questions are "yes" → interested
+        from .models import LeadStatus
+        
+        q1_is_yes = None
+        q2_is_yes = None
+        q3_is_yes = None
+        
+        # Check Q1: Yes if preparing OR (not preparing but interested in future)
+        q1_preparing = call_summary.q1_preparing_usmle_residency
+        q1_interested = call_summary.q1_interested_future
+        
+        if q1_preparing is not None:
+            if q1_preparing is True:
+                q1_is_yes = True
+            elif q1_preparing is False:
+                if q1_interested is True:
+                    q1_is_yes = True
+                elif q1_interested is False:
+                    q1_is_yes = False  # No to both = No
+        
+        # Check Q2: Yes if looking for opportunities OR (not looking but wants to learn more)
+        q2_clinical = call_summary.q2_clinical_research_opportunities
+        q2_learn_more = call_summary.q2_want_to_learn_more
+        
+        if q2_clinical is not None:
+            if q2_clinical is True:
+                q2_is_yes = True
+            elif q2_clinical is False:
+                if q2_learn_more is True:
+                    q2_is_yes = True
+                elif q2_learn_more is False:
+                    q2_is_yes = False  # No to both = No
+        
+        # Check Q3: Yes if wants call/both OR (wants info and also wants call)
+        q3_preference = call_summary.q3_preference
+        q3_want_call = call_summary.q3_want_call_after_info
+        
+        if q3_preference:
+            if q3_preference in ['call', 'both']:
+                q3_is_yes = True
+            elif q3_preference == 'none':
+                q3_is_yes = False
+            elif q3_preference == 'info':
+                if q3_want_call is True:
+                    q3_is_yes = True
+                elif q3_want_call is False:
+                    q3_is_yes = False  # Info only, doesn't want call = No
+        
+        # Determine status: if any No → not_interested, if all Yes → interested
+        answers = [q1_is_yes, q2_is_yes, q3_is_yes]
+        answered_questions = [a for a in answers if a is not None]
+        
+        if not answered_questions:
+            # No questions answered, keep current status
+            new_status = lead.status
+        elif any(a is False for a in answered_questions):
+            # At least one "No" answer
+            new_status = LeadStatus.NOT_INTERESTED
+        elif all(a is True for a in answered_questions):
+            # All answered questions are "Yes"
+            new_status = LeadStatus.INTERESTED
+        else:
+            # Mixed or incomplete answers
+            new_status = LeadStatus.CONTACTED
+        
+        # Update lead status if it changed
+        if lead.status != new_status:
+            lead.status = new_status
+            lead._changed_by = tenant_user
+            lead.save(update_fields=['status', 'updated_at'])
+        
+        return Response(LeadCallSummarySerializer(call_summary).data, status=status.HTTP_201_CREATED)

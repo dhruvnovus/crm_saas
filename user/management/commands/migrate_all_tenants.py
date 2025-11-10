@@ -150,6 +150,17 @@ class Command(BaseCommand):
                             WHERE app = 'leads' AND name = '0002_leadhistory'
                         """)
                         leads_0002_exists = test_cursor.fetchone()[0] > 0
+
+                        # Check if leads.0007 migration is applied (LeadCallSummary)
+                        test_cursor.execute("""
+                            SELECT COUNT(*) FROM django_migrations
+                            WHERE app = 'leads' AND name = '0007_remove_lead_call_summaries_leadcallsummary'
+                        """)
+                        leads_0007_exists = test_cursor.fetchone()[0] > 0
+
+                        # Check if leads_leadcallsummary table exists
+                        test_cursor.execute("SHOW TABLES LIKE 'leads_leadcallsummary'")
+                        lead_call_summary_exists = test_cursor.fetchone() is not None
                         
                         test_cursor.close()
                         test_conn.close()
@@ -257,6 +268,57 @@ class Command(BaseCommand):
                                         database=database_name, fake=True, verbosity=verbosity)
                             if verbosity >= 1:
                                 self.stdout.write(f'✓ Faked leads.0002 migration')
+
+                        # Ensure leads.0007 (LeadCallSummary) - create table if missing, then fake migration
+                        if not leads_0007_exists:
+                            if not lead_call_summary_exists:
+                                if verbosity >= 1:
+                                    self.stdout.write('Creating leads_leadcallsummary table...')
+                                # Disable FK checks temporarily
+                                test_cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+                                # Try to create with foreign keys; if that fails, fall back without FKs
+                                try:
+                                    test_cursor.execute("""
+                                        CREATE TABLE IF NOT EXISTS `leads_leadcallsummary` (
+                                            `id` char(32) NOT NULL PRIMARY KEY,
+                                            `created_at` datetime(6) NOT NULL,
+                                            `updated_at` datetime(6) NOT NULL,
+                                            `tenant_id` char(32) NOT NULL,
+                                            `lead_id` char(32) NOT NULL,
+                                            `summary` longtext NOT NULL,
+                                            `call_time` datetime(6) NULL,
+                                            `created_by_id` bigint NULL,
+                                            `is_active` bool NOT NULL DEFAULT 1,
+                                            KEY `leads_leadc_tenant_lead_created_idx` (`tenant_id`, `lead_id`, `created_at`),
+                                            KEY `leads_leadc_tenant_created_idx` (`tenant_id`, `created_at`),
+                                            CONSTRAINT `leadcallsummary_lead_fk` FOREIGN KEY (`lead_id`) REFERENCES `leads_lead` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+                                            CONSTRAINT `leadcallsummary_created_by_fk` FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                                        ) ENGINE=InnoDB;
+                                    """)
+                                except Exception:
+                                    # Fallback: create without foreign keys to avoid FK issues on older tenants
+                                    test_cursor.execute("""
+                                        CREATE TABLE IF NOT EXISTS `leads_leadcallsummary` (
+                                            `id` char(32) NOT NULL PRIMARY KEY,
+                                            `created_at` datetime(6) NOT NULL,
+                                            `updated_at` datetime(6) NOT NULL,
+                                            `tenant_id` char(32) NOT NULL,
+                                            `lead_id` char(32) NOT NULL,
+                                            `summary` longtext NOT NULL,
+                                            `call_time` datetime(6) NULL,
+                                            `created_by_id` bigint NULL,
+                                            `is_active` bool NOT NULL DEFAULT 1,
+                                            KEY `leads_leadc_tenant_lead_created_idx` (`tenant_id`, `lead_id`, `created_at`),
+                                            KEY `leads_leadc_tenant_created_idx` (`tenant_id`, `created_at`)
+                                        ) ENGINE=InnoDB;
+                                    """)
+                                test_cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                                test_conn.commit()
+                            # Fake the migration since table now exists (or already existed)
+                            call_command('migrate', 'leads', '0007_remove_lead_call_summaries_leadcallsummary',
+                                        database=database_name, fake=True, verbosity=verbosity)
+                            if verbosity >= 1:
+                                self.stdout.write(f'✓ Faked leads.0007 migration')
                     except Exception as e:
                         if verbosity >= 2:
                             self.stdout.write(f'Warning: Could not check/fake migrations: {e}')

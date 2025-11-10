@@ -214,3 +214,8 @@ EMAIL_USE_TLS = True
 EMAIL_HOST_USER = 'dhruv.novuscode@gmail.com'
 EMAIL_HOST_PASSWORD = 'icgw bxhu wpfq gypp'
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+
+# Campaign API settings
+CAMPAIGN_API_BASE_URL = os.getenv('CAMPAIGN_API_BASE_URL', 'https://da03ef1527d5.ngrok-free.app')
+CAMPAIGN_API_START_ENDPOINT = os.getenv('CAMPAIGN_API_START_ENDPOINT', '/api/campaign/start_v2')
+CAMPAIGN_API_URL = f"{CAMPAIGN_API_BASE_URL}{CAMPAIGN_API_START_ENDPOINT}"

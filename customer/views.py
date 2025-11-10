@@ -6,11 +6,18 @@ from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from django.utils.decorators import method_decorator
+from django.db import models
+from django.conf import settings
+import requests
+import logging
 from .models import Customer, CustomerHistory
 from user.models import CustomUser
-from .serializers import CustomerSerializer
+from .serializers import CustomerSerializer, CustomerLeadStatusSerializer
 from .history_serializers import CustomerHistorySerializer
 from .importer import detect_and_parse_tabular, normalize_customer_row
+from leads.models import Lead, LeadStatus
+
+logger = logging.getLogger(__name__)
 
 
 @method_decorator(
@@ -103,7 +110,9 @@ class CustomerListCreateView(generics.ListCreateAPIView):
                 is_staff=request.user.is_staff,
                 is_superuser=request.user.is_superuser,
                 password=request.user.password,
-                tenant=request.user.tenant,
+                # IMPORTANT: Do not set tenant FK inside tenant DB to avoid
+                # cross-database FK constraint issues. Leave it NULL here.
+                tenant=None,
             )
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -265,7 +274,8 @@ class CustomerImportView(APIView):
                 is_staff=request.user.is_staff,
                 is_superuser=request.user.is_superuser,
                 password=request.user.password,
-                tenant=request.user.tenant,
+                # IMPORTANT: Prevent FK error by keeping tenant NULL inside tenant DB
+                tenant=None,
             )
 
         try:
@@ -401,3 +411,207 @@ class CustomerHistoryView(generics.ListAPIView):
             customer=customer,
             tenant=self.request.user.tenant
         ).select_related('changed_by').order_by('-created_at')
+
+
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        operation_description='Get customers that match any of: no leads, follow-up leads, new status leads, or interested status leads (no pagination). Returns HubSpot-like format.',
+        responses={
+            200: openapi.Response(
+                description='List of customers in HubSpot format',
+                examples={
+                    'application/json': [
+                        {
+                            'id': '161292840091',
+                            'properties': {
+                                'phone': '+918490981272',
+                                'firstname': 'olivia',
+                                'lastname': 'thompson',
+                                'email': 'olivia.thompson@yopmail.com',
+                                'hs_lead_status': 'ATTEMPTED_TO_CONTACT',
+                            },
+                            'company': {
+                                'name': 'Medical Center Inc',
+                            },
+                        },
+                        {
+                            'id': '161292840092',
+                            'properties': {
+                                'phone': '+918490981273',
+                                'firstname': 'john',
+                                'lastname': 'doe',
+                                'email': 'john.doe@example.com',
+                                'hs_lead_status': 'INTERESTED',
+                            },
+                        }
+                    ],
+                },
+            )
+        },
+    ),
+)
+class CustomersByLeadStatusView(generics.ListAPIView):
+    """API endpoint to retrieve customers that have no leads, follow-up leads, new status leads, or interested status leads"""
+    permission_classes = [IsAuthenticated]
+    serializer_class = CustomerLeadStatusSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name', 'email', 'phone', 'company', 'city', 'state', 'country']
+    pagination_class = None  # Disable pagination
+
+    def get_queryset(self):
+        if not hasattr(self.request.user, 'tenant') or not self.request.user.tenant:
+            return Customer.objects.none()
+        
+        from django.db import connections
+        from django.db.models import Q, Exists, OuterRef, Case, When, Value, CharField, Subquery
+        connections['default'].tenant = self.request.user.tenant
+        
+        # Base queryset for active customers
+        base_queryset = Customer.objects.filter(
+            tenant=self.request.user.tenant,
+            is_active=True
+        )
+        
+        # Build conditions using subqueries for better performance
+        # 1. Customers with no leads at all
+        has_any_lead = Lead.objects.filter(
+            tenant=self.request.user.tenant,
+            customer_id=OuterRef('pk')
+        )
+        
+        # 2. Customers with follow-up leads
+        has_follow_up_lead = Lead.objects.filter(
+            tenant=self.request.user.tenant,
+            customer_id=OuterRef('pk'),
+            status=LeadStatus.FOLLOW_UP,
+            is_active=True
+        )
+        
+        # 3. Customers with new status leads
+        has_new_lead = Lead.objects.filter(
+            tenant=self.request.user.tenant,
+            customer_id=OuterRef('pk'),
+            status=LeadStatus.NEW,
+            is_active=True
+        )
+        
+        # 4. Customers with interested status leads
+        has_interested_lead = Lead.objects.filter(
+            tenant=self.request.user.tenant,
+            customer_id=OuterRef('pk'),
+            status=LeadStatus.INTERESTED,
+            is_active=True
+        )
+        
+        # Check if customer has phone or has a lead with phone
+        has_customer_phone = Q(phone__isnull=False) & ~Q(phone='')
+        has_lead_with_phone = Exists(
+            Lead.objects.filter(
+                tenant=self.request.user.tenant,
+                customer_id=OuterRef('pk'),
+                phone__isnull=False
+            ).exclude(phone='')
+        )
+        
+        # Filter: customer must have phone OR have a lead with phone
+        base_queryset = base_queryset.filter(has_customer_phone | has_lead_with_phone)
+        
+        # Annotate with lead phone for serializer (use lead phone if customer phone is missing)
+        lead_phone_subquery = Lead.objects.filter(
+            tenant=self.request.user.tenant,
+            customer_id=OuterRef('pk'),
+            phone__isnull=False
+        ).exclude(phone='').order_by('-created_at').values('phone')[:1]
+        
+        base_queryset = base_queryset.annotate(
+            lead_phone=Subquery(lead_phone_subquery)
+        )
+        
+        # Annotate with lead status for serializer context
+        # Priority: follow_up > interested > new > no_leads
+        base_queryset = base_queryset.annotate(
+            lead_status_annotation=Case(
+                When(Exists(has_follow_up_lead), then=Value('ATTEMPTED_TO_CONTACT')),
+                When(Exists(has_interested_lead), then=Value('INTERESTED')),
+                When(Exists(has_new_lead), then=Value('NEW')),
+                When(~Exists(has_any_lead), then=Value('NOT_CONTACTED')),
+                default=Value(None),
+                output_field=CharField()
+            )
+        )
+        
+        # Combine conditions: (no leads) OR (follow-up leads) OR (new status leads) OR (interested status leads)
+        return base_queryset.filter(
+            ~Exists(has_any_lead) | Exists(has_follow_up_lead) | Exists(has_new_lead) | Exists(has_interested_lead)
+        ).distinct().order_by('-created_at')
+
+    def list(self, request, *args, **kwargs):
+        """
+        Override list method to:
+        1. Get customers (limited to 10)
+        2. Serialize the response
+        3. Call external POST API with the serialized data and token
+        4. Return the external API response
+        """
+        # Get queryset and limit to 10 customers
+        queryset = self.filter_queryset(self.get_queryset())[:10]
+        
+        # Serialize the data
+        serializer = self.get_serializer(queryset, many=True)
+        customers_data = serializer.data
+        
+        # Extract token from request.auth
+        # In DRF TokenAuthentication, request.auth is the Token object
+        token = None
+        if request.auth and hasattr(request.auth, 'key'):
+            token = request.auth.key
+        
+        # Prepare payload with customers data and token
+        payload = {
+            'customers': customers_data,
+        }
+        if token:
+            payload['token'] = token
+        
+        # Call external POST API with the serialized data
+        external_api_url = settings.CAMPAIGN_API_URL
+        
+        try:
+            # Make POST request to external API
+            # Note: ngrok-free.app may require bypass header to avoid interstitial page
+            headers = {
+                'Content-Type': 'application/json',
+                'ngrok-skip-browser-warning': 'true'  # Bypass ngrok warning page
+            }
+            response = requests.post(
+                external_api_url,
+                json=payload,
+                headers=headers,
+                timeout=30  # 30 seconds timeout
+            )
+            
+            # Log the response for debugging
+            logger.info(f"External API call to {external_api_url} returned status {response.status_code}")
+            
+            # Return the external API response
+            try:
+                response_data = response.json()
+            except ValueError:
+                # If response is not JSON, return text
+                response_data = {'message': response.text, 'status_code': response.status_code}
+            
+            return Response(response_data, status=response.status_code)
+            
+        except requests.exceptions.RequestException as e:
+            # Handle any request exceptions (timeout, connection error, etc.)
+            logger.error(f"Error calling external API {external_api_url}: {str(e)}")
+            return Response(
+                {
+                    'error': 'Failed to call external API',
+                    'detail': str(e),
+                    'payload': payload  # Return the original payload in case of error
+                },
+                status=status.HTTP_502_BAD_GATEWAY
+            )

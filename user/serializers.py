@@ -77,37 +77,9 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         
         if created:
             # Create database for new tenant
+            # This will call setup_tenant_tables which creates all required tables
+            # including customer_customerhistory, leads_lead, leads_leadhistory, etc.
             tenant.create_database()
-
-            # After creating the tenant DB, run migrations to create all tables
-            # so the tenant is ready to use immediately after registration
-            try:
-                from django.conf import settings
-                from django.db import connections
-                from django.core.management import call_command
-
-                database_name = tenant.database_name
-
-                # Add dynamic DB config for this tenant if not present
-                if database_name not in connections.databases:
-                    connections.databases[database_name] = {
-                        'ENGINE': 'django.db.backends.mysql',
-                        'NAME': database_name,
-                        'USER': settings.DATABASES['default']['USER'],
-                        'PASSWORD': settings.DATABASES['default']['PASSWORD'],
-                        'HOST': settings.DATABASES['default']['HOST'],
-                        'PORT': settings.DATABASES['default']['PORT'],
-                        'OPTIONS': {
-                            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-                        },
-                    }
-
-                # Run migrations for the tenant database (creates user/customer/leads/authtoken tables, etc.)
-                call_command('migrate', database=database_name, verbosity=0)
-            except Exception:
-                # If migrations fail here, we still allow registration to succeed;
-                # tenant APIs will error until an admin fixes the DB.
-                pass
         
         # Create user
         user = CustomUser.objects.create_user(**validated_data)

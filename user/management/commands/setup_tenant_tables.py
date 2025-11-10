@@ -126,7 +126,7 @@ class Command(BaseCommand):
                     'django_admin_log', 'user_customuser', 'user_tenantuser', 
                     'user_history', 'auth_user_groups', 'auth_user_user_permissions', 
                     'authtoken_token', 'customer_customer', 'customer_customerhistory', 
-                    'leads_lead', 'leads_leadhistory'
+                    'leads_lead', 'leads_leadhistory', 'leads_leadcallsummary'
                 ]
                 missing_tables = [table for table in required_tables if table not in existing_tables]
                 if not missing_tables:
@@ -177,12 +177,26 @@ class Command(BaseCommand):
                 'customer_customer',
                 'customer_customerhistory',
                 'leads_lead',
-                'leads_leadhistory'
+                'leads_leadhistory',
+                'leads_leadcallsummary'
             ]
+            
+            # Tenant-specific tables that should NOT be copied from main DB
+            # (they have different FK constraints or don't exist in main DB)
+            tenant_specific_tables = ['customer_customerhistory', 'leads_lead', 'leads_leadhistory', 'leads_leadcallsummary']
             
             # Create each required table
             for table_name in required_tables:
-                if table_name in main_tables:
+                # For tenant-specific tables, always create explicitly (skip main DB copy)
+                if table_name in tenant_specific_tables:
+                    # Check if table already exists in tenant database
+                    cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+                    if cursor.fetchone():
+                        self.stdout.write(f'Table {table_name} already exists, skipping')
+                        continue
+                    # Fall through to explicit creation in else block
+                
+                if table_name in main_tables and table_name not in tenant_specific_tables:
                     # Check if table already exists in tenant database
                     cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
                     if cursor.fetchone():
@@ -256,9 +270,15 @@ class Command(BaseCommand):
                         cursor.execute(create_sql)
                         self.stdout.write('Created table: leads_lead (explicit)')
                     elif table_name == 'customer_customerhistory':
-                        # Create customer history table with FKs to customer_customer, tenant, and user_customuser
+                        # Drop table if it exists (might be partial/incomplete)
+                        try:
+                            cursor.execute("DROP TABLE IF EXISTS `customer_customerhistory`")
+                        except Exception:
+                            pass
+                        
+                        # Create customer history table first without foreign keys
                         create_sql = """
-                            CREATE TABLE IF NOT EXISTS `customer_customerhistory` (
+                            CREATE TABLE `customer_customerhistory` (
                                 `id` char(32) NOT NULL PRIMARY KEY,
                                 `created_at` datetime(6) NOT NULL,
                                 `updated_at` datetime(6) NOT NULL,
@@ -273,17 +293,90 @@ class Command(BaseCommand):
                                 `notes` longtext NULL,
                                 KEY `customer_cu_custome_cb020b_idx` (`customer_id`, `created_at`),
                                 KEY `customer_cu_tenant__33f174_idx` (`tenant_id`, `created_at`),
-                                KEY `customer_cu_action_7efb1a_idx` (`action`, `created_at`),
-                                CONSTRAINT `customerhistory_customer_fk` FOREIGN KEY (`customer_id`) REFERENCES `customer_customer` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
-                                CONSTRAINT `customerhistory_changed_by_fk` FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                                KEY `customer_cu_action_7efb1a_idx` (`action`, `created_at`)
                             ) ENGINE=InnoDB;
                         """
                         cursor.execute(create_sql)
                         self.stdout.write('Created table: customer_customerhistory (explicit)')
+                        
+                        # Add foreign keys separately to avoid type mismatch errors
+                        # Note: FK checks are still disabled from earlier in the function
+                        try:
+                            # Check if customer_customer table exists
+                            cursor.execute("SHOW TABLES LIKE 'customer_customer'")
+                            if cursor.fetchone():
+                                # Get the exact column definition for customer_customer.id
+                                cursor.execute("""
+                                    SELECT COLUMN_TYPE, CHARACTER_SET_NAME, COLLATION_NAME 
+                                    FROM INFORMATION_SCHEMA.COLUMNS
+                                    WHERE TABLE_SCHEMA = DATABASE()
+                                      AND TABLE_NAME = 'customer_customer'
+                                      AND COLUMN_NAME = 'id'
+                                """)
+                                customer_id_info = cursor.fetchone()
+                                
+                                if customer_id_info:
+                                    # Try to add foreign key, but don't fail if it doesn't work
+                                    # The table structure is more important than FK constraints
+                                    try:
+                                        # Drop existing constraint if it exists
+                                        try:
+                                            cursor.execute("""
+                                                ALTER TABLE `customer_customerhistory`
+                                                DROP FOREIGN KEY `customerhistory_customer_fk`
+                                            """)
+                                        except Exception:
+                                            pass  # Constraint doesn't exist, that's fine
+                                        
+                                        # Add foreign key to customer_customer
+                                        # FK checks should still be disabled from line 144
+                                        cursor.execute("""
+                                            ALTER TABLE `customer_customerhistory`
+                                            ADD CONSTRAINT `customerhistory_customer_fk`
+                                            FOREIGN KEY (`customer_id`) REFERENCES `customer_customer` (`id`)
+                                            ON DELETE CASCADE ON UPDATE CASCADE
+                                        """)
+                                        self.stdout.write('Added foreign key: customerhistory_customer_fk')
+                                    except Exception as fk_add_error:
+                                        # FK constraint failed, but table structure is correct
+                                        # This is acceptable - Django will handle referential integrity at application level
+                                        self.stdout.write(f'Note: Could not add customer foreign key constraint (table still created): {fk_add_error}')
+                                else:
+                                    self.stdout.write('Warning: Could not get customer table info for foreign key')
+                        except Exception as fk_error:
+                            # Outer exception handler - log but don't fail
+                            self.stdout.write(f'Warning: Could not add customer foreign key: {fk_error}')
+                        
+                        try:
+                            # Drop existing constraint if it exists
+                            try:
+                                cursor.execute("""
+                                    ALTER TABLE `customer_customerhistory`
+                                    DROP FOREIGN KEY `customerhistory_changed_by_fk`
+                                """)
+                            except Exception:
+                                pass  # Constraint doesn't exist, that's fine
+                            
+                            # Add foreign key to user_customuser
+                            cursor.execute("""
+                                ALTER TABLE `customer_customerhistory`
+                                ADD CONSTRAINT `customerhistory_changed_by_fk`
+                                FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`)
+                                ON DELETE SET NULL ON UPDATE CASCADE
+                            """)
+                            self.stdout.write('Added foreign key: customerhistory_changed_by_fk')
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add changed_by foreign key: {fk_error}')
                     elif table_name == 'leads_leadhistory':
-                        # Create lead history table with FKs to leads_lead, tenant, and user_customuser
+                        # Drop table if it exists (might be partial/incomplete)
+                        try:
+                            cursor.execute("DROP TABLE IF EXISTS `leads_leadhistory`")
+                        except Exception:
+                            pass
+                        
+                        # Create lead history table first without foreign keys
                         create_sql = """
-                            CREATE TABLE IF NOT EXISTS `leads_leadhistory` (
+                            CREATE TABLE `leads_leadhistory` (
                                 `id` char(32) NOT NULL PRIMARY KEY,
                                 `created_at` datetime(6) NOT NULL,
                                 `updated_at` datetime(6) NOT NULL,
@@ -298,13 +391,107 @@ class Command(BaseCommand):
                                 `notes` longtext NULL,
                                 KEY `leads_leadh_lead_id_0512de_idx` (`lead_id`, `created_at`),
                                 KEY `leads_leadh_tenant__086cc8_idx` (`tenant_id`, `created_at`),
-                                KEY `leads_leadh_action_5746c6_idx` (`action`, `created_at`),
-                                CONSTRAINT `leadhistory_lead_fk` FOREIGN KEY (`lead_id`) REFERENCES `leads_lead` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
-                                CONSTRAINT `leadhistory_changed_by_fk` FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                                KEY `leads_leadh_action_5746c6_idx` (`action`, `created_at`)
                             ) ENGINE=InnoDB;
                         """
                         cursor.execute(create_sql)
                         self.stdout.write('Created table: leads_leadhistory (explicit)')
+                        
+                        # Add foreign keys separately to avoid type mismatch errors
+                        try:
+                            # Check if leads_lead table exists
+                            cursor.execute("SHOW TABLES LIKE 'leads_lead'")
+                            if cursor.fetchone():
+                                # Drop existing constraint if it exists
+                                try:
+                                    cursor.execute("""
+                                        ALTER TABLE `leads_leadhistory`
+                                        DROP FOREIGN KEY `leadhistory_lead_fk`
+                                    """)
+                                except Exception:
+                                    pass  # Constraint doesn't exist, that's fine
+                                
+                                # Add foreign key to leads_lead
+                                cursor.execute("""
+                                    ALTER TABLE `leads_leadhistory`
+                                    ADD CONSTRAINT `leadhistory_lead_fk`
+                                    FOREIGN KEY (`lead_id`) REFERENCES `leads_lead` (`id`)
+                                    ON DELETE CASCADE ON UPDATE CASCADE
+                                """)
+                                self.stdout.write('Added foreign key: leadhistory_lead_fk')
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add lead foreign key: {fk_error}')
+                        
+                        try:
+                            # Drop existing constraint if it exists
+                            try:
+                                cursor.execute("""
+                                    ALTER TABLE `leads_leadhistory`
+                                    DROP FOREIGN KEY `leadhistory_changed_by_fk`
+                                """)
+                            except Exception:
+                                pass  # Constraint doesn't exist, that's fine
+                            
+                            # Add foreign key to user_customuser
+                            cursor.execute("""
+                                ALTER TABLE `leads_leadhistory`
+                                ADD CONSTRAINT `leadhistory_changed_by_fk`
+                                FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`)
+                                ON DELETE SET NULL ON UPDATE CASCADE
+                            """)
+                            self.stdout.write('Added foreign key: leadhistory_changed_by_fk')
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add changed_by foreign key: {fk_error}')
+                    elif table_name == 'leads_leadcallsummary':
+                        # Drop table if it exists (might be partial/incomplete)
+                        try:
+                            cursor.execute("DROP TABLE IF EXISTS `leads_leadcallsummary`")
+                        except Exception:
+                            pass
+                        # Create lead call summary table first without foreign keys
+                        create_sql = """
+                            CREATE TABLE `leads_leadcallsummary` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `lead_id` char(32) NOT NULL,
+                                `summary` longtext NOT NULL,
+                                `call_time` datetime(6) NULL,
+                                `created_by_id` bigint NULL,
+                                `is_active` tinyint(1) NOT NULL DEFAULT 1,
+                                KEY `leads_leadc_tenant_lead_created_idx` (`tenant_id`, `lead_id`, `created_at`),
+                                KEY `leads_leadc_tenant_created_idx` (`tenant_id`, `created_at`)
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: leads_leadcallsummary (explicit)')
+                        # Attempt to add foreign keys; ignore failures
+                        try:
+                            cursor.execute("SHOW TABLES LIKE 'leads_lead'")
+                            if cursor.fetchone():
+                                try:
+                                    cursor.execute("""
+                                        ALTER TABLE `leads_leadcallsummary`
+                                        ADD CONSTRAINT `leadcallsummary_lead_fk`
+                                        FOREIGN KEY (`lead_id`) REFERENCES `leads_lead` (`id`)
+                                        ON DELETE CASCADE ON UPDATE CASCADE
+                                    """)
+                                except Exception:
+                                    pass
+                            cursor.execute("SHOW TABLES LIKE 'user_customuser'")
+                            if cursor.fetchone():
+                                try:
+                                    cursor.execute("""
+                                        ALTER TABLE `leads_leadcallsummary`
+                                        ADD CONSTRAINT `leadcallsummary_created_by_fk`
+                                        FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`)
+                                        ON DELETE SET NULL ON UPDATE CASCADE
+                                    """)
+                                except Exception:
+                                    pass
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add leadcallsummary foreign keys: {fk_error}')
                     else:
                         self.stdout.write(f'Warning: Table {table_name} not found in main database')
             

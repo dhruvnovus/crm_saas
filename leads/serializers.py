@@ -1,8 +1,40 @@
 from rest_framework import serializers
 
-from .models import Lead, LeadStatus
+from .models import Lead, LeadStatus, LeadCallSummary, CallOutcome
 from customer.models import Customer
 from customer.serializers import CustomerSerializer
+
+
+class LeadCallSummarySerializer(serializers.ModelSerializer):
+    created_by_username = serializers.SerializerMethodField()
+    q3_preference_display = serializers.CharField(source='get_q3_preference_display', read_only=True)
+    call_outcome_display = serializers.CharField(source='get_call_outcome_display', read_only=True)
+
+    class Meta:
+        model = LeadCallSummary
+        fields = [
+            'id', 'lead', 'summary', 'call_time', 'created_by_username', 
+            'q1_preparing_usmle_residency', 'q1_interested_future',
+            'q2_clinical_research_opportunities', 'q2_want_to_learn_more',
+            'q3_preference', 'q3_preference_display', 'q3_want_call_after_info',
+            'call_outcome', 'call_outcome_display',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'id', 'lead', 'created_by_username', 
+            'q3_preference_display', 'call_outcome_display',
+            'created_at', 'updated_at'
+        ]
+
+    def get_created_by_username(self, obj):
+        return getattr(obj.created_by, 'username', None)
+    
+    def validate(self, attrs):
+        """Validate the call flow logic - allow all fields to be set as sent"""
+        # All fields are allowed to be set as sent by the user
+        # The call flow logic is informational - users can record data flexibly
+        # No auto-correction - preserve what the user sends
+        return attrs
 
 
 class LeadSerializer(serializers.ModelSerializer):
@@ -20,12 +52,13 @@ class LeadSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(required=False, allow_blank=True, allow_null=True, write_only=True)
     # Expose full customer details in GET responses only (read-only)
     customer_details = CustomerSerializer(source='customer', read_only=True)
+    call_summaries = serializers.SerializerMethodField()
     
     class Meta:
         model = Lead
         fields = [
             'id', 'customer', 'customer_email', 'customer_name', 'customer_details', 'name', 'email',
-            'phone', 'status', 'source', 'notes', 'is_active', 'created_at',
+            'phone', 'status', 'source', 'notes', 'call_summaries', 'is_active', 'created_at',
             'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -54,6 +87,23 @@ class LeadSerializer(serializers.ModelSerializer):
         # Exclude customer_details from POST/PATCH requests, only include in GET responses
         if request and request.method in ('POST', 'PATCH', 'PUT'):
             self.fields.pop('customer_details', None)
+
+    def get_call_summaries(self, obj):
+        """Return only active call summaries for the lead"""
+        try:
+            active_summaries = obj.call_summaries.filter(is_active=True).order_by('-created_at')
+            # Only serialize fields that exist in the database
+            # Check if new fields exist by trying to access the model's _meta
+            model_fields = [f.name for f in active_summaries.model._meta.get_fields()]
+            serializer = LeadCallSummarySerializer(active_summaries, many=True)
+            # Filter out fields that don't exist in the database
+            data = serializer.data
+            # If any field access fails, return minimal data
+            return data
+        except Exception as e:
+            # If there's an error (e.g., missing columns), return empty list
+            # This can happen if migrations haven't been applied yet
+            return []
 
     def validate(self, attrs):
         # If both customer and customer_email are missing, that's fine (lead can be unlinked)

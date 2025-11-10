@@ -1,6 +1,6 @@
-from django.db.models.signals import post_save, pre_save
+from django.db.models.signals import post_save, pre_save, pre_delete
 from django.dispatch import receiver
-from .models import Lead, LeadHistory
+from .models import Lead, LeadHistory, LeadCallSummary
 import json
 
 
@@ -133,4 +133,177 @@ def lead_post_save(sender, instance, created, **kwargs):
                         changes=changes,
                         notes=f"Updated fields: {', '.join(changed_fields)}"
                     )
+
+
+@receiver(pre_save, sender=LeadCallSummary)
+def lead_call_summary_pre_save(sender, instance, **kwargs):
+    """Store the old instance before save to compare changes"""
+    if instance.pk:
+        try:
+            old_instance = LeadCallSummary.objects.get(pk=instance.pk)
+            instance._old_instance = old_instance
+        except LeadCallSummary.DoesNotExist:
+            instance._old_instance = None
+    else:
+        instance._old_instance = None
+
+
+@receiver(post_save, sender=LeadCallSummary)
+def lead_call_summary_post_save(sender, instance, created, **kwargs):
+    """Track call summary changes in LeadHistory"""
+    # Get the user from the instance
+    changed_by = None
+    if hasattr(instance, '_changed_by'):
+        changed_by = instance._changed_by
+    elif hasattr(instance, 'created_by') and created:
+        changed_by = instance.created_by
+    
+    lead = instance.lead
+    tenant = instance.tenant
+    
+    # Ensure we're in the tenant database context
+    from django.db import connections
+    if hasattr(connections['default'], 'tenant'):
+        connections['default'].tenant = tenant
+    
+    if created:
+        # Record call summary creation
+        summary_text = instance.summary or ""
+        summary_preview = summary_text[:200] if len(summary_text) > 200 else summary_text
+        summary_display = f"{summary_text[:100]}..." if len(summary_text) > 100 else summary_text or "No summary"
+        
+        LeadHistory.objects.create(
+            lead=lead,
+            tenant=tenant,
+            changed_by=changed_by,
+            action='updated',
+            field_name='call_summary',
+            old_value=None,
+            new_value=f"Call summary added: {summary_display}",
+            changes={
+                'call_summary_id': str(instance.id),
+                'action': 'added',
+                'summary_preview': summary_preview,
+                'call_time': str(instance.call_time) if instance.call_time else None,
+                'q1_preparing_usmle_residency': instance.q1_preparing_usmle_residency,
+                'q1_interested_future': instance.q1_interested_future,
+                'q2_clinical_research_opportunities': instance.q2_clinical_research_opportunities,
+                'q2_want_to_learn_more': instance.q2_want_to_learn_more,
+                'q3_preference': instance.q3_preference,
+                'q3_want_call_after_info': instance.q3_want_call_after_info,
+                'call_outcome': instance.call_outcome,
+            },
+            notes=f"Call summary added for lead. Summary: {summary_display}"
+        )
+    else:
+        # Record call summary updates
+        old_instance = getattr(instance, '_old_instance', None)
+        if old_instance:
+            changes = {}
+            tracked_fields = [
+                'summary', 'call_time', 'is_active',
+                'q1_preparing_usmle_residency', 'q1_interested_future',
+                'q2_clinical_research_opportunities', 'q2_want_to_learn_more',
+                'q3_preference', 'q3_want_call_after_info', 'call_outcome'
+            ]
+            
+            for field_name in tracked_fields:
+                old_value = get_field_value(old_instance, field_name)
+                new_value = get_field_value(instance, field_name)
+                
+                if old_value != new_value:
+                    changes[field_name] = {
+                        'old': old_value,
+                        'new': new_value
+                    }
+            
+            if changes:
+                # Check if this is a soft delete (is_active changed to False)
+                if 'is_active' in changes and changes['is_active']['new'] == 'False':
+                    old_summary = old_instance.summary or ""
+                    summary_display = f"{old_summary[:100]}..." if len(old_summary) > 100 else old_summary or "No summary"
+                    LeadHistory.objects.create(
+                        lead=lead,
+                        tenant=tenant,
+                        changed_by=changed_by,
+                        action='deleted',
+                        field_name='call_summary',
+                        old_value=f"Call summary: {summary_display}",
+                        new_value='Deleted',
+                        changes={
+                            'call_summary_id': str(instance.id),
+                            'action': 'deleted',
+                            **changes
+                        },
+                        notes=f"Call summary deleted for lead. Summary was: {summary_display}"
+                    )
+                    changes.pop('is_active', None)
+                
+                # Record other call summary changes if any
+                if changes:
+                    changed_fields = list(changes.keys())
+                    LeadHistory.objects.create(
+                        lead=lead,
+                        tenant=tenant,
+                        changed_by=changed_by,
+                        action='updated',
+                        field_name='call_summary',
+                        old_value=f"Call summary (ID: {instance.id})",
+                        new_value=f"Call summary (ID: {instance.id}) - Updated",
+                        changes={
+                            'call_summary_id': str(instance.id),
+                            'action': 'updated',
+                            **changes
+                        },
+                        notes=f"Call summary updated for lead. Changed fields: {', '.join(changed_fields)}"
+                    )
+
+
+@receiver(pre_delete, sender=LeadCallSummary)
+def lead_call_summary_pre_delete(sender, instance, **kwargs):
+    """Track call summary deletion in LeadHistory before the object is deleted"""
+    lead = instance.lead
+    tenant = instance.tenant
+    
+    # Ensure we're in the tenant database context
+    from django.db import connections
+    if hasattr(connections['default'], 'tenant'):
+        connections['default'].tenant = tenant
+    
+    # Get the user - try to get from instance if available
+    changed_by = None
+    if hasattr(instance, '_changed_by'):
+        changed_by = instance._changed_by
+    elif hasattr(instance, 'created_by'):
+        changed_by = instance.created_by
+    
+    # Record hard delete (if is_active is True, meaning it wasn't soft-deleted)
+    if instance.is_active:
+        summary_text = instance.summary or ""
+        summary_preview = summary_text[:200] if len(summary_text) > 200 else summary_text
+        summary_display = f"{summary_text[:100]}..." if len(summary_text) > 100 else summary_text or "No summary"
+        
+        LeadHistory.objects.create(
+            lead=lead,
+            tenant=tenant,
+            changed_by=changed_by,
+            action='deleted',
+            field_name='call_summary',
+            old_value=f"Call summary: {summary_display}",
+            new_value='Hard deleted',
+            changes={
+                'call_summary_id': str(instance.id),
+                'action': 'hard_deleted',
+                'summary_preview': summary_preview,
+                'call_time': str(instance.call_time) if instance.call_time else None,
+                'q1_preparing_usmle_residency': instance.q1_preparing_usmle_residency,
+                'q1_interested_future': instance.q1_interested_future,
+                'q2_clinical_research_opportunities': instance.q2_clinical_research_opportunities,
+                'q2_want_to_learn_more': instance.q2_want_to_learn_more,
+                'q3_preference': instance.q3_preference,
+                'q3_want_call_after_info': instance.q3_want_call_after_info,
+                'call_outcome': instance.call_outcome,
+            },
+            notes=f"Call summary hard deleted for lead. Summary was: {summary_display}"
+        )
 
