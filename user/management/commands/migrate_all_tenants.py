@@ -49,6 +49,12 @@ class Command(BaseCommand):
             try:
                 database_name = tenant.database_name
                 
+                # Guard: skip tenants with empty/invalid database names
+                if not database_name:
+                    self.stdout.write(self.style.ERROR("✗ Error running migrations for : Unable to create the django_migrations table ((1046, 'No database selected'))"))
+                    failed += 1
+                    continue
+                
                 # Create database connection configuration
                 tenant_db_config = {
                     'ENGINE': 'django.db.backends.mysql',
@@ -140,6 +146,13 @@ class Command(BaseCommand):
                         """)
                         customer_0003_exists = test_cursor.fetchone()[0] > 0
                         
+                        # Check if customer.0005 migration is already applied
+                        test_cursor.execute("""
+                            SELECT COUNT(*) FROM django_migrations
+                            WHERE app = 'customer' AND name = '0005_customerhistory'
+                        """)
+                        customer_0005_exists = test_cursor.fetchone()[0] > 0
+                        
                         # Check if leads_leadhistory table exists
                         test_cursor.execute("SHOW TABLES LIKE 'leads_leadhistory'")
                         leads_history_exists = test_cursor.fetchone() is not None
@@ -151,6 +164,13 @@ class Command(BaseCommand):
                         """)
                         leads_0002_exists = test_cursor.fetchone()[0] > 0
 
+                        # Check if leads.0004 migration is already applied
+                        test_cursor.execute("""
+                            SELECT COUNT(*) FROM django_migrations
+                            WHERE app = 'leads' AND name = '0004_leadhistory'
+                        """)
+                        leads_0004_exists = test_cursor.fetchone()[0] > 0
+
                         # Check if leads.0007 migration is applied (LeadCallSummary)
                         test_cursor.execute("""
                             SELECT COUNT(*) FROM django_migrations
@@ -161,9 +181,6 @@ class Command(BaseCommand):
                         # Check if leads_leadcallsummary table exists
                         test_cursor.execute("SHOW TABLES LIKE 'leads_leadcallsummary'")
                         lead_call_summary_exists = test_cursor.fetchone() is not None
-                        
-                        test_cursor.close()
-                        test_conn.close()
                         
                         # Fake customer.0002 if columns exist but migration not marked
                         if column_count >= 6 and not customer_0002_exists:
@@ -208,6 +225,13 @@ class Command(BaseCommand):
                                         database=database_name, fake=True, verbosity=verbosity)
                             if verbosity >= 1:
                                 self.stdout.write(f'✓ Faked customer.0003 migration')
+                        
+                        # If the customer history table exists but 0005 (CreateModel) isn't marked, fake 0005
+                        if customer_history_exists and not customer_0005_exists:
+                            call_command('migrate', 'customer', '0005_customerhistory',
+                                        database=database_name, fake=True, verbosity=verbosity)
+                            if verbosity >= 1:
+                                self.stdout.write(f'✓ Faked customer.0005 migration (table already exists)')
                         
                         # Check if leads.0001 migration is already applied
                         test_cursor.execute("""
@@ -268,60 +292,110 @@ class Command(BaseCommand):
                                         database=database_name, fake=True, verbosity=verbosity)
                             if verbosity >= 1:
                                 self.stdout.write(f'✓ Faked leads.0002 migration')
-
-                        # Ensure leads.0007 (LeadCallSummary) - create table if missing, then fake migration
-                        if not leads_0007_exists:
-                            if not lead_call_summary_exists:
-                                if verbosity >= 1:
-                                    self.stdout.write('Creating leads_leadcallsummary table...')
-                                # Disable FK checks temporarily
-                                test_cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
-                                # Try to create with foreign keys; if that fails, fall back without FKs
-                                try:
-                                    test_cursor.execute("""
-                                        CREATE TABLE IF NOT EXISTS `leads_leadcallsummary` (
-                                            `id` char(32) NOT NULL PRIMARY KEY,
-                                            `created_at` datetime(6) NOT NULL,
-                                            `updated_at` datetime(6) NOT NULL,
-                                            `tenant_id` char(32) NOT NULL,
-                                            `lead_id` char(32) NOT NULL,
-                                            `summary` longtext NOT NULL,
-                                            `call_time` datetime(6) NULL,
-                                            `created_by_id` bigint NULL,
-                                            `is_active` bool NOT NULL DEFAULT 1,
-                                            KEY `leads_leadc_tenant_lead_created_idx` (`tenant_id`, `lead_id`, `created_at`),
-                                            KEY `leads_leadc_tenant_created_idx` (`tenant_id`, `created_at`),
-                                            CONSTRAINT `leadcallsummary_lead_fk` FOREIGN KEY (`lead_id`) REFERENCES `leads_lead` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
-                                            CONSTRAINT `leadcallsummary_created_by_fk` FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
-                                        ) ENGINE=InnoDB;
-                                    """)
-                                except Exception:
-                                    # Fallback: create without foreign keys to avoid FK issues on older tenants
-                                    test_cursor.execute("""
-                                        CREATE TABLE IF NOT EXISTS `leads_leadcallsummary` (
-                                            `id` char(32) NOT NULL PRIMARY KEY,
-                                            `created_at` datetime(6) NOT NULL,
-                                            `updated_at` datetime(6) NOT NULL,
-                                            `tenant_id` char(32) NOT NULL,
-                                            `lead_id` char(32) NOT NULL,
-                                            `summary` longtext NOT NULL,
-                                            `call_time` datetime(6) NULL,
-                                            `created_by_id` bigint NULL,
-                                            `is_active` bool NOT NULL DEFAULT 1,
-                                            KEY `leads_leadc_tenant_lead_created_idx` (`tenant_id`, `lead_id`, `created_at`),
-                                            KEY `leads_leadc_tenant_created_idx` (`tenant_id`, `created_at`)
-                                        ) ENGINE=InnoDB;
-                                    """)
-                                test_cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
-                                test_conn.commit()
-                            # Fake the migration since table now exists (or already existed)
-                            call_command('migrate', 'leads', '0007_remove_lead_call_summaries_leadcallsummary',
+                        
+                        # If the leads history table exists but 0004 (CreateModel) isn't marked, fake 0004
+                        if leads_history_exists and not leads_0004_exists:
+                            call_command('migrate', 'leads', '0004_leadhistory',
                                         database=database_name, fake=True, verbosity=verbosity)
                             if verbosity >= 1:
+                                self.stdout.write(f'✓ Faked leads.0004 migration (table already exists)')
+
+                        # Ensure leads_leadcallsummary table exists; if missing, create it
+                        if not lead_call_summary_exists:
+                            if verbosity >= 1:
+                                self.stdout.write('Creating leads_leadcallsummary table...')
+                            # Disable FK checks temporarily
+                            test_cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+                            # Try to create with foreign keys; if that fails, fall back without FKs
+                            try:
+                                test_cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS `leads_leadcallsummary` (
+                                        `id` char(32) NOT NULL PRIMARY KEY,
+                                        `created_at` datetime(6) NOT NULL,
+                                        `updated_at` datetime(6) NOT NULL,
+                                        `tenant_id` char(32) NOT NULL,
+                                        `lead_id` char(32) NOT NULL,
+                                        `summary` longtext NOT NULL,
+                                        `call_time` datetime(6) NULL,
+                                        `created_by_id` bigint NULL,
+                                        `is_active` bool NOT NULL DEFAULT 1,
+                                        KEY `leads_leadc_tenant_lead_created_idx` (`tenant_id`, `lead_id`, `created_at`),
+                                        KEY `leads_leadc_tenant_created_idx` (`tenant_id`, `created_at`),
+                                        CONSTRAINT `leadcallsummary_lead_fk` FOREIGN KEY (`lead_id`) REFERENCES `leads_lead` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+                                        CONSTRAINT `leadcallsummary_created_by_fk` FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                                    ) ENGINE=InnoDB;
+                                """)
+                            except Exception:
+                                # Fallback: create without foreign keys to avoid FK issues on older tenants
+                                test_cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS `leads_leadcallsummary` (
+                                        `id` char(32) NOT NULL PRIMARY KEY,
+                                        `created_at` datetime(6) NOT NULL,
+                                        `updated_at` datetime(6) NOT NULL,
+                                        `tenant_id` char(32) NOT NULL,
+                                        `lead_id` char(32) NOT NULL,
+                                        `summary` longtext NOT NULL,
+                                        `call_time` datetime(6) NULL,
+                                        `created_by_id` bigint NULL,
+                                        `is_active` bool NOT NULL DEFAULT 1,
+                                        KEY `leads_leadc_tenant_lead_created_idx` (`tenant_id`, `lead_id`, `created_at`),
+                                        KEY `leads_leadc_tenant_created_idx` (`tenant_id`, `created_at`)
+                                    ) ENGINE=InnoDB;
+                                """)
+                            test_cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                            test_conn.commit()
+                        else:
+                            # Table exists: ensure all expected columns exist; add if missing
+                            expected_columns = {
+                                'q1_preparing_usmle_residency': "ALTER TABLE `leads_leadcallsummary` ADD COLUMN `q1_preparing_usmle_residency` bool NULL AFTER `is_active`",
+                                'q1_interested_future': "ALTER TABLE `leads_leadcallsummary` ADD COLUMN `q1_interested_future` bool NULL AFTER `q1_preparing_usmle_residency`",
+                                'q2_clinical_research_opportunities': "ALTER TABLE `leads_leadcallsummary` ADD COLUMN `q2_clinical_research_opportunities` bool NULL AFTER `q1_interested_future`",
+                                'q2_want_to_learn_more': "ALTER TABLE `leads_leadcallsummary` ADD COLUMN `q2_want_to_learn_more` bool NULL AFTER `q2_clinical_research_opportunities`",
+                                'q3_preference': "ALTER TABLE `leads_leadcallsummary` ADD COLUMN `q3_preference` varchar(10) NULL AFTER `q2_want_to_learn_more`",
+                                'q3_want_call_after_info': "ALTER TABLE `leads_leadcallsummary` ADD COLUMN `q3_want_call_after_info` bool NULL AFTER `q3_preference`",
+                                'call_outcome': "ALTER TABLE `leads_leadcallsummary` ADD COLUMN `call_outcome` varchar(20) NULL AFTER `q3_want_call_after_info`",
+                            }
+                            for column_name, alter_sql in expected_columns.items():
+                                test_cursor.execute("""
+                                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                                    WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'leads_leadcallsummary' AND COLUMN_NAME = %s
+                                """, (database_name, column_name))
+                                col_exists = test_cursor.fetchone()[0] > 0
+                                if not col_exists:
+                                    if verbosity >= 1:
+                                        self.stdout.write(f"Adding missing column leads_leadcallsummary.{column_name} ...")
+                                    try:
+                                        test_cursor.execute(alter_sql)
+                                        test_conn.commit()
+                                    except Exception as column_err:
+                                        # If adding with AFTER fails due to column order, try without AFTER
+                                        try:
+                                            fallback_sql = alter_sql.split(" AFTER ")[0]
+                                            test_cursor.execute(fallback_sql)
+                                            test_conn.commit()
+                                        except Exception:
+                                            if verbosity >= 2:
+                                                self.stdout.write(f"Warning: Could not add column {column_name}: {column_err}")
+                        # If migration 0007 is not marked, fake it now that the table exists
+                        if not leads_0007_exists:
+                            call_command('migrate', 'leads', '0007_remove_lead_call_summaries_leadcallsummary',
+                                         database=database_name, fake=True, verbosity=verbosity)
+                            if verbosity >= 1:
                                 self.stdout.write(f'✓ Faked leads.0007 migration')
+                        
+                        # Close the connection after all table operations are done
+                        test_cursor.close()
+                        test_conn.close()
                     except Exception as e:
                         if verbosity >= 2:
                             self.stdout.write(f'Warning: Could not check/fake migrations: {e}')
+                        # Ensure connection is closed even if there's an error
+                        try:
+                            test_cursor.close()
+                            test_conn.close()
+                        except (NameError, AttributeError):
+                            # Variables may not be defined if exception occurred early
+                            pass
                     
                     # Use fake_initial=True to handle tables created by setup_tenant_tables
                     # This will mark existing migrations as applied without recreating tables
