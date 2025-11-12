@@ -29,6 +29,52 @@ class LeadCallSummarySerializer(serializers.ModelSerializer):
     def get_created_by_username(self, obj):
         return getattr(obj.created_by, 'username', None)
     
+    def to_representation(self, instance):
+        """Convert boolean fields to 'Yes'/'No' in API responses"""
+        data = super().to_representation(instance)
+        
+        # List of boolean fields to convert
+        boolean_fields = [
+            'q1_preparing_usmle_residency',
+            'q1_interested_future',
+            'q2_clinical_research_opportunities',
+            'q2_want_to_learn_more',
+            'q3_want_call_after_info',
+        ]
+        
+        # Convert boolean values to "Yes"/"No"
+        for field in boolean_fields:
+            if field in data:
+                value = data[field]
+                if isinstance(value, bool):
+                    data[field] = "Yes" if value else "No"
+                # If None or not a boolean, leave as is
+        
+        return data
+    
+    def to_internal_value(self, data):
+        """Convert 'Yes'/'No' strings to boolean values when receiving data"""
+        # List of boolean fields that might be sent as "Yes"/"No"
+        boolean_fields = [
+            'q1_preparing_usmle_residency',
+            'q1_interested_future',
+            'q2_clinical_research_opportunities',
+            'q2_want_to_learn_more',
+            'q3_want_call_after_info',
+        ]
+        
+        # Convert "Yes"/"No" strings to booleans
+        for field in boolean_fields:
+            if field in data and isinstance(data[field], str):
+                value = data[field].strip()
+                if value.lower() == 'yes':
+                    data[field] = True
+                elif value.lower() == 'no':
+                    data[field] = False
+                # If not "yes" or "no", let DRF handle the validation
+        
+        return super().to_internal_value(data)
+    
     def validate(self, attrs):
         """Validate the call flow logic - allow all fields to be set as sent"""
         # All fields are allowed to be set as sent by the user
@@ -95,7 +141,8 @@ class LeadSerializer(serializers.ModelSerializer):
             # Only serialize fields that exist in the database
             # Check if new fields exist by trying to access the model's _meta
             model_fields = [f.name for f in active_summaries.model._meta.get_fields()]
-            serializer = LeadCallSummarySerializer(active_summaries, many=True)
+            # Pass context to nested serializer to ensure proper serialization
+            serializer = LeadCallSummarySerializer(active_summaries, many=True, context=self.context)
             # Filter out fields that don't exist in the database
             data = serializer.data
             # If any field access fails, return minimal data
