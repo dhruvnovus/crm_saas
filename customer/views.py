@@ -15,9 +15,105 @@ from user.models import CustomUser
 from .serializers import CustomerSerializer, CustomerLeadStatusSerializer
 from .history_serializers import CustomerHistorySerializer
 from .importer import detect_and_parse_tabular, normalize_customer_row
-from leads.models import Lead, LeadStatus
+from leads.models import Lead, LeadStatus, LeadCallSummary
 
 logger = logging.getLogger(__name__)
+
+
+def annotate_customer_queryset(queryset, tenant):
+    """
+    Helper function to annotate customer queryset with is_lead_created and last_call_time.
+    This optimizes queries by using database annotations instead of N+1 queries.
+    """
+    from django.db.models import Exists, OuterRef, Subquery
+    from django.db.models.functions import Coalesce
+    
+    # Annotate with is_lead_created: check if customer has any leads
+    has_lead = Lead.objects.filter(
+        tenant=tenant,
+        customer_id=OuterRef('pk')
+    )
+    queryset = queryset.annotate(
+        is_lead_created_annotation=Exists(has_lead)
+    )
+    
+    # Annotate with last_call_time: get the most recent call_time from call summaries
+    # Prefer call_time, fallback to created_at if call_time is null
+    # Get the latest call_time (preferred)
+    latest_call_time = Subquery(
+        LeadCallSummary.objects.filter(
+            tenant=tenant,
+            lead__customer_id=OuterRef('pk'),
+            is_active=True,
+            call_time__isnull=False
+        ).order_by('-call_time').values('call_time')[:1]
+    )
+    
+    # Get the latest created_at (fallback)
+    latest_created_at = Subquery(
+        LeadCallSummary.objects.filter(
+            tenant=tenant,
+            lead__customer_id=OuterRef('pk'),
+            is_active=True
+        ).order_by('-created_at').values('created_at')[:1]
+    )
+    
+    # Use Coalesce to prefer call_time, fallback to created_at
+    queryset = queryset.annotate(
+        last_call_time_annotation=Coalesce(latest_call_time, latest_created_at)
+    )
+    
+    return queryset
+
+
+def annotate_lead_status(queryset, tenant):
+    """
+    Helper function to annotate customer queryset with lead_status.
+    Priority: follow_up > interested > new > no_leads
+    """
+    from django.db.models import Exists, OuterRef, Case, When, Value, CharField
+    
+    # Build conditions for different lead statuses
+    has_any_lead = Lead.objects.filter(
+        tenant=tenant,
+        customer_id=OuterRef('pk')
+    )
+    
+    has_follow_up_lead = Lead.objects.filter(
+        tenant=tenant,
+        customer_id=OuterRef('pk'),
+        status=LeadStatus.FOLLOW_UP,
+        is_active=True
+    )
+    
+    has_interested_lead = Lead.objects.filter(
+        tenant=tenant,
+        customer_id=OuterRef('pk'),
+        status=LeadStatus.INTERESTED,
+        is_active=True
+    )
+    
+    has_new_lead = Lead.objects.filter(
+        tenant=tenant,
+        customer_id=OuterRef('pk'),
+        status=LeadStatus.NEW,
+        is_active=True
+    )
+    
+    # Annotate with lead status
+    # Priority: follow_up > interested > new > no_leads
+    queryset = queryset.annotate(
+        lead_status_annotation=Case(
+            When(Exists(has_follow_up_lead), then=Value('ATTEMPTED_TO_CONTACT')),
+            When(Exists(has_interested_lead), then=Value('INTERESTED')),
+            When(Exists(has_new_lead), then=Value('NEW')),
+            When(~Exists(has_any_lead), then=Value('NOT_CONTACTED')),
+            default=Value(None),
+            output_field=CharField()
+        )
+    )
+    
+    return queryset
 
 
 @method_decorator(
@@ -81,7 +177,12 @@ class CustomerListCreateView(generics.ListCreateAPIView):
             from django.db import connections
             connections['default'].tenant = self.request.user.tenant
             # Default ordering: newest first
-            return Customer.objects.filter(tenant=self.request.user.tenant).order_by('-created_at')
+            queryset = Customer.objects.filter(tenant=self.request.user.tenant).order_by('-created_at')
+            # Annotate with is_lead_created and last_call_time
+            queryset = annotate_customer_queryset(queryset, self.request.user.tenant)
+            # Annotate with lead_status
+            queryset = annotate_lead_status(queryset, self.request.user.tenant)
+            return queryset
         return Customer.objects.none()
 
     def create(self, request, *args, **kwargs):
@@ -191,7 +292,12 @@ class CustomerDetailView(generics.RetrieveUpdateDestroyAPIView):
         if hasattr(self.request.user, 'tenant') and self.request.user.tenant:
             from django.db import connections
             connections['default'].tenant = self.request.user.tenant
-            return Customer.objects.filter(tenant=self.request.user.tenant)
+            queryset = Customer.objects.filter(tenant=self.request.user.tenant)
+            # Annotate with is_lead_created and last_call_time
+            queryset = annotate_customer_queryset(queryset, self.request.user.tenant)
+            # Annotate with lead_status
+            queryset = annotate_lead_status(queryset, self.request.user.tenant)
+            return queryset
         return Customer.objects.none()
 
     def perform_update(self, serializer):
@@ -543,9 +649,14 @@ class CustomersByLeadStatusView(generics.ListAPIView):
         )
         
         # Combine conditions: (no leads) OR (follow-up leads) OR (new status leads) OR (interested status leads)
-        return base_queryset.filter(
+        base_queryset = base_queryset.filter(
             ~Exists(has_any_lead) | Exists(has_follow_up_lead) | Exists(has_new_lead) | Exists(has_interested_lead)
         ).distinct().order_by('-created_at')
+        
+        # Annotate with is_lead_created and last_call_time
+        base_queryset = annotate_customer_queryset(base_queryset, self.request.user.tenant)
+        
+        return base_queryset
 
     def list(self, request, *args, **kwargs):
         """
@@ -581,6 +692,196 @@ class CustomersByLeadStatusView(generics.ListAPIView):
         try:
             # Make POST request to external API
             # Note: ngrok-free.app may require bypass header to avoid interstitial page
+            headers = {
+                'Content-Type': 'application/json',
+                'ngrok-skip-browser-warning': 'true'  # Bypass ngrok warning page
+            }
+            response = requests.post(
+                external_api_url,
+                json=payload,
+                headers=headers,
+                timeout=30  # 30 seconds timeout
+            )
+            
+            # Log the response for debugging
+            logger.info(f"External API call to {external_api_url} returned status {response.status_code}")
+            
+            # Return the external API response
+            try:
+                response_data = response.json()
+            except ValueError:
+                # If response is not JSON, return text
+                response_data = {'message': response.text, 'status_code': response.status_code}
+            
+            return Response(response_data, status=response.status_code)
+            
+        except requests.exceptions.RequestException as e:
+            # Handle any request exceptions (timeout, connection error, etc.)
+            logger.error(f"Error calling external API {external_api_url}: {str(e)}")
+            return Response(
+                {
+                    'error': 'Failed to call external API',
+                    'detail': str(e),
+                    'payload': payload  # Return the original payload in case of error
+                },
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+
+
+@method_decorator(
+    name='get',
+    decorator=swagger_auto_schema(
+        tags=['Customers'],
+        operation_description='Get a specific customer by ID that matches any of: no leads, follow-up leads, new status leads, or interested status leads. Returns HubSpot-like format and calls external API.',
+        responses={
+            200: openapi.Response(
+                description='Customer in HubSpot format',
+                examples={
+                    'application/json': {
+                        'id': '161292840091',
+                        'properties': {
+                            'phone': '+918490981272',
+                            'firstname': 'olivia',
+                            'lastname': 'thompson',
+                            'email': 'olivia.thompson@yopmail.com',
+                            'hs_lead_status': 'ATTEMPTED_TO_CONTACT',
+                        },
+                        'company': {
+                            'name': 'Medical Center Inc',
+                        },
+                    },
+                },
+            ),
+            404: openapi.Response(description='Customer not found'),
+        },
+    ),
+)
+class CustomerByIdByLeadStatusView(APIView):
+    """API endpoint to retrieve a specific customer by ID that matches lead status conditions"""
+    permission_classes = [IsAuthenticated]
+    serializer_class = CustomerLeadStatusSerializer
+
+    def get(self, request, pk, *args, **kwargs):
+        """
+        Get a specific customer by ID, serialize it, call external POST API, and return the response.
+        """
+        if not hasattr(request.user, 'tenant') or not request.user.tenant:
+            return Response({'detail': 'No tenant associated'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        from django.db import connections
+        from django.db.models import Subquery
+        connections['default'].tenant = request.user.tenant
+        
+        try:
+            # Get the customer
+            customer = Customer.objects.get(
+                id=pk,
+                tenant=request.user.tenant,
+                is_active=True
+            )
+        except Customer.DoesNotExist:
+            return Response({'detail': 'Customer not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if customer has phone or has a lead with phone
+        has_customer_phone = customer.phone and customer.phone.strip()
+        has_lead_with_phone = Lead.objects.filter(
+            tenant=request.user.tenant,
+            customer_id=customer.id,
+            phone__isnull=False
+        ).exclude(phone='').exists()
+        
+        if not (has_customer_phone or has_lead_with_phone):
+            return Response(
+                {'detail': 'Customer must have phone or have a lead with phone'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check lead status conditions
+        has_any_lead = Lead.objects.filter(
+            tenant=request.user.tenant,
+            customer_id=customer.id
+        ).exists()
+        
+        has_follow_up_lead = Lead.objects.filter(
+            tenant=request.user.tenant,
+            customer_id=customer.id,
+            status=LeadStatus.FOLLOW_UP,
+            is_active=True
+        ).exists()
+        
+        has_new_lead = Lead.objects.filter(
+            tenant=request.user.tenant,
+            customer_id=customer.id,
+            status=LeadStatus.NEW,
+            is_active=True
+        ).exists()
+        
+        has_interested_lead = Lead.objects.filter(
+            tenant=request.user.tenant,
+            customer_id=customer.id,
+            status=LeadStatus.INTERESTED,
+            is_active=True
+        ).exists()
+        
+        # Check if customer matches the conditions
+        matches_conditions = (
+            not has_any_lead or 
+            has_follow_up_lead or 
+            has_new_lead or 
+            has_interested_lead
+        )
+        
+        if not matches_conditions:
+            return Response(
+                {'detail': 'Customer does not match lead status conditions'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Annotate with lead phone for serializer (use lead phone if customer phone is missing)
+        lead_phone_subquery = Lead.objects.filter(
+            tenant=request.user.tenant,
+            customer_id=customer.id,
+            phone__isnull=False
+        ).exclude(phone='').order_by('-created_at').values('phone')[:1]
+        
+        # Annotate customer with lead phone, is_lead_created, and last_call_time
+        customer_queryset = Customer.objects.filter(id=customer.id).annotate(
+            lead_phone=Subquery(lead_phone_subquery)
+        )
+        # Add is_lead_created and last_call_time annotations
+        customer_queryset = annotate_customer_queryset(customer_queryset, request.user.tenant)
+        customer_with_annotation = customer_queryset.first()
+        
+        # Annotate with lead status for serializer context
+        # Priority: follow_up > interested > new > no_leads
+        customer_with_annotation.lead_status_annotation = (
+            'ATTEMPTED_TO_CONTACT' if has_follow_up_lead else
+            'INTERESTED' if has_interested_lead else
+            'NEW' if has_new_lead else
+            'NOT_CONTACTED' if not has_any_lead else None
+        )
+        
+        # Serialize the customer
+        serializer = self.serializer_class(customer_with_annotation)
+        customer_data = serializer.data
+        
+        # Extract token from request.auth
+        token = None
+        if request.auth and hasattr(request.auth, 'key'):
+            token = request.auth.key
+        
+        # Prepare payload with customer data and token
+        payload = {
+            'customers': [customer_data],  # Wrap in array to match expected format
+        }
+        if token:
+            payload['token'] = token
+        
+        # Call external POST API with the serialized data
+        external_api_url = settings.CAMPAIGN_API_URL
+        
+        try:
+            # Make POST request to external API
             headers = {
                 'Content-Type': 'application/json',
                 'ngrok-skip-browser-warning': 'true'  # Bypass ngrok warning page
