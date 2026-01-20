@@ -79,6 +79,13 @@ class TenantDatabaseRouter:
                     return self._get_tenant_connection(tenant)
                 return 'default'
 
+            # Handle auth/contenttypes for tenant-scoped permissions/groups
+            if model._meta.app_label in ['auth', 'contenttypes']:
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
             # Handle authtoken app models (Token model)
             elif model._meta.app_label == 'authtoken':
                 tenant = getattr(connection, 'tenant', None)
@@ -124,6 +131,13 @@ class TenantDatabaseRouter:
                     return self._get_tenant_connection(tenant)
                 return 'default'
 
+            # Handle auth/contenttypes for tenant-scoped permissions/groups
+            if model._meta.app_label in ['auth', 'contenttypes']:
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
             # Handle authtoken app models (Token model)
             elif model._meta.app_label == 'authtoken':
                 tenant = getattr(connection, 'tenant', None)
@@ -153,6 +167,10 @@ class TenantDatabaseRouter:
         elif app_label == 'authtoken':
             # Ensure Token model exists in both default and tenant databases
             # so superusers (default DB) and tenant users can authenticate
+            return True
+        elif app_label in ['auth', 'contenttypes']:
+            # Permissions, groups, and content types should exist in both
+            # the default DB and tenant DBs so each tenant has isolated roles
             return True
         elif app_label == 'customer':
             # Customer tables should live only in tenant databases

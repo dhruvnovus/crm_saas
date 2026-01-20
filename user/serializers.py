@@ -474,6 +474,56 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
         return user
 
 
+from django.contrib.auth.models import Group, Permission  # noqa: E402
+
+
+class PermissionSerializer(serializers.ModelSerializer):
+    """Serializer for auth_permission"""
+
+    app_label = serializers.CharField(source="content_type.app_label", read_only=True)
+    model = serializers.CharField(source="content_type.model", read_only=True)
+
+    class Meta:
+        model = Permission
+        fields = ["id", "codename", "name", "app_label", "model"]
+        read_only_fields = fields
+
+
+class GroupSerializer(serializers.ModelSerializer):
+    """Serializer for auth_group with permissions"""
+
+    permissions = serializers.PrimaryKeyRelatedField(
+        queryset=Permission.objects.all(), many=True, required=False
+    )
+
+    class Meta:
+        model = Group
+        fields = ["id", "name", "permissions"]
+
+
+class UserGroupPermissionSerializer(serializers.Serializer):
+    """Serializer to assign groups and user-specific permissions to a user"""
+
+    group_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, allow_empty=True
+    )
+    permission_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, allow_empty=True
+    )
+
+    def validate(self, attrs):
+        # Simple existence validation; DB routing handled by views
+        group_ids = attrs.get("group_ids") or []
+        perm_ids = attrs.get("permission_ids") or []
+
+        if group_ids and not Group.objects.filter(id__in=group_ids).exists():
+            raise serializers.ValidationError({"group_ids": "One or more groups not found"})
+        if perm_ids and not Permission.objects.filter(id__in=perm_ids).exists():
+            raise serializers.ValidationError({"permission_ids": "One or more permissions not found"})
+        return attrs
+
+
+
 class PasswordOTPRequestSerializer(serializers.Serializer):
     """Serializer for requesting a password reset/change OTP by email"""
     email = serializers.EmailField()

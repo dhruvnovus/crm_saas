@@ -14,8 +14,8 @@ from django.db import models
 from datetime import datetime, timedelta
 from .models import Tenant, TenantUser, CustomUser, History
 from .serializers import (
-    UserRegistrationSerializer, 
-    UserLoginSerializer, 
+    UserRegistrationSerializer,
+    UserLoginSerializer,
     UserSerializer,
     TenantSerializer,
     HistorySerializer,
@@ -23,7 +23,10 @@ from .serializers import (
     CreateTenantUserSerializer,
     ChangePasswordSerializer,
     PasswordResetRequestSerializer,
-    PasswordResetConfirmSerializer
+    PasswordResetConfirmSerializer,
+    PermissionSerializer,
+    GroupSerializer,
+    UserGroupPermissionSerializer,
 )
 from django.core.mail import send_mail
 from django.conf import settings
@@ -31,6 +34,7 @@ from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import urlsafe_base64_encode
 from django.utils.encoding import force_bytes
 from django.utils import timezone
+from django.contrib.auth.models import Group, Permission
 import random
 
 
@@ -940,3 +944,200 @@ def change_password_with_otp(request):
         serializer.save()
         return Response({'message': 'Password changed successfully'}, status=status.HTTP_200_OK)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ===== Tenant-scoped Permissions & Groups =====
+
+def _resolve_tenant_for_admin(request):
+    """
+    For superusers, allow specifying tenant via X-Tenant header or ?tenant query.
+    For regular tenant admins, use their own tenant.
+    Returns (tenant_obj or None, error_response or None).
+    """
+    from django.db import connections
+
+    user = request.user
+    tenant_obj = None
+
+    if getattr(user, "tenant", None):
+        tenant_obj = user.tenant
+    else:
+        tenant_name = request.META.get("HTTP_X_TENANT") or request.GET.get("tenant")
+        if tenant_name:
+            try:
+                tenant_obj = Tenant.objects.get(name=tenant_name, is_active=True)
+            except Tenant.DoesNotExist:
+                return None, Response({"error": "Tenant not found or inactive"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not tenant_obj:
+        return None, Response({"error": "No tenant associated or provided"}, status=status.HTTP_400_BAD_REQUEST)
+
+    connections["default"].tenant = tenant_obj
+    return tenant_obj, None
+
+
+@method_decorator(
+    name="get",
+    decorator=swagger_auto_schema(
+        tags=["Permissions"],
+        operation_description="List all permissions available in the current tenant database "
+        "(or main DB for tenant admins/superusers).",
+    ),
+)
+class PermissionListView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated, IsTenantAdminOrSuperuser]
+    serializer_class = PermissionSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ["codename", "name", "content_type__app_label"]
+
+    def get_queryset(self):
+        from django.db import connections
+
+        # Route to correct DB (tenant or main)
+        connections["default"].tenant = None
+        if getattr(self.request.user, "tenant", None) and not self.request.user.is_superuser:
+            connections["default"].tenant = self.request.user.tenant
+        return Permission.objects.all().order_by("content_type__app_label", "codename")
+
+
+@method_decorator(
+    name="get",
+    decorator=swagger_auto_schema(
+        tags=["Permissions"],
+        operation_description="List groups for the current tenant (or main DB for superusers).",
+    ),
+)
+@method_decorator(
+    name="post",
+    decorator=swagger_auto_schema(
+        tags=["Permissions"],
+        operation_description="Create a new group for the current tenant and assign permissions.",
+    ),
+)
+class GroupListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsAuthenticated, IsTenantAdminOrSuperuser]
+    serializer_class = GroupSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ["name"]
+
+    def get_queryset(self):
+        from django.db import connections
+
+        # Route to tenant DB or main DB
+        connections["default"].tenant = None
+        if getattr(self.request.user, "tenant", None) and not self.request.user.is_superuser:
+            connections["default"].tenant = self.request.user.tenant
+        return Group.objects.all().order_by("name")
+
+    def perform_create(self, serializer):
+        # DB routing handled in get_queryset by DRF internals (same DB alias)
+        serializer.save()
+
+
+@method_decorator(
+    name="get",
+    decorator=swagger_auto_schema(tags=["Permissions"], operation_description="Retrieve a group."),
+)
+@method_decorator(
+    name="patch",
+    decorator=swagger_auto_schema(tags=["Permissions"], operation_description="Update a group name/permissions."),
+)
+@method_decorator(
+    name="delete",
+    decorator=swagger_auto_schema(tags=["Permissions"], operation_description="Delete a group."),
+)
+class GroupDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [IsAuthenticated, IsTenantAdminOrSuperuser]
+    serializer_class = GroupSerializer
+    lookup_field = "pk"
+
+    def get_queryset(self):
+        from django.db import connections
+
+        connections["default"].tenant = None
+        if getattr(self.request.user, "tenant", None) and not self.request.user.is_superuser:
+            connections["default"].tenant = self.request.user.tenant
+        return Group.objects.all().order_by("name")
+
+
+@swagger_auto_schema(
+    method="get",
+    tags=["Permissions"],
+    operation_description=(
+        "Get effective permissions for a user in the current tenant (direct + via groups). "
+        "Tenant admin/superuser only."
+    ),
+)
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, IsTenantAdminOrSuperuser])
+def user_permissions_detail(request, user_id):
+    from django.db import connections
+
+    try:
+        # Route to tenant DB if applicable
+        connections["default"].tenant = None
+        if getattr(request.user, "tenant", None) and not request.user.is_superuser:
+            connections["default"].tenant = request.user.tenant
+
+        target_user = CustomUser.objects.get(pk=user_id)
+        perms = target_user.get_all_permissions()
+        return Response({"user_id": target_user.id, "permissions": sorted(list(perms))})
+    except CustomUser.DoesNotExist:
+        return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+    finally:
+        try:
+            connections["default"].tenant = None
+        except Exception:
+            pass
+
+
+@swagger_auto_schema(
+    method="post",
+    tags=["Permissions"],
+    request_body=UserGroupPermissionSerializer,
+    operation_description=(
+        "Assign groups and direct permissions to a user in the current tenant. "
+        "Overwrites existing membership/permissions."
+    ),
+)
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, IsTenantAdminOrSuperuser])
+def set_user_groups_permissions(request, user_id):
+    from django.db import connections
+
+    serializer = UserGroupPermissionSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        connections["default"].tenant = None
+        if getattr(request.user, "tenant", None) and not request.user.is_superuser:
+            connections["default"].tenant = request.user.tenant
+
+        try:
+            target_user = CustomUser.objects.get(pk=user_id)
+        except CustomUser.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        group_ids = serializer.validated_data.get("group_ids") or []
+        perm_ids = serializer.validated_data.get("permission_ids") or []
+
+        groups = Group.objects.filter(id__in=group_ids)
+        perms = Permission.objects.filter(id__in=perm_ids)
+
+        target_user.groups.set(groups)
+        target_user.user_permissions.set(perms)
+
+        return Response(
+            {
+                "user_id": target_user.id,
+                "group_ids": list(groups.values_list("id", flat=True)),
+                "permission_ids": list(perms.values_list("id", flat=True)),
+            },
+            status=status.HTTP_200_OK,
+        )
+    finally:
+        try:
+            connections["default"].tenant = None
+        except Exception:
+            pass
