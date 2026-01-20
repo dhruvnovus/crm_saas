@@ -72,6 +72,13 @@ class TenantDatabaseRouter:
                     return self._get_tenant_connection(tenant)
                 return 'default'
 
+            # Handle branch app models
+            if model._meta.app_label == 'branch':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
             # Handle authtoken app models (Token model)
             elif model._meta.app_label == 'authtoken':
                 tenant = getattr(connection, 'tenant', None)
@@ -105,6 +112,13 @@ class TenantDatabaseRouter:
 
             # Handle leads app models
             if model._meta.app_label == 'leads':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
+            # Handle branch app models
+            if model._meta.app_label == 'branch':
                 tenant = getattr(connection, 'tenant', None)
                 if tenant:
                     return self._get_tenant_connection(tenant)
@@ -145,5 +159,8 @@ class TenantDatabaseRouter:
             return db != 'default'
         elif app_label == 'leads':
             # Lead tables should live only in tenant databases
+            return db != 'default'
+        elif app_label == 'branch':
+            # Branch tables should live only in tenant databases
             return db != 'default'
         return db == 'default'

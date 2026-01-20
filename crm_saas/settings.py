@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     'user',
     'customer',
     'leads',
+    'branch',
 ]
 
 MIDDLEWARE = [
