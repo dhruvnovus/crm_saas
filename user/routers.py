@@ -79,6 +79,13 @@ class TenantDatabaseRouter:
                     return self._get_tenant_connection(tenant)
                 return 'default'
 
+            # Handle category app models
+            if model._meta.app_label == 'category':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
             # Handle auth/contenttypes for tenant-scoped permissions/groups
             if model._meta.app_label in ['auth', 'contenttypes']:
                 tenant = getattr(connection, 'tenant', None)
@@ -126,6 +133,13 @@ class TenantDatabaseRouter:
 
             # Handle branch app models
             if model._meta.app_label == 'branch':
+                tenant = getattr(connection, 'tenant', None)
+                if tenant:
+                    return self._get_tenant_connection(tenant)
+                return 'default'
+
+            # Handle category app models
+            if model._meta.app_label == 'category':
                 tenant = getattr(connection, 'tenant', None)
                 if tenant:
                     return self._get_tenant_connection(tenant)
@@ -180,5 +194,8 @@ class TenantDatabaseRouter:
             return db != 'default'
         elif app_label == 'branch':
             # Branch tables should live only in tenant databases
+            return db != 'default'
+        elif app_label == 'category':
+            # Category tables should live only in tenant databases
             return db != 'default'
         return db == 'default'

@@ -178,12 +178,16 @@ class Command(BaseCommand):
                 'customer_customerhistory',
                 'leads_lead',
                 'leads_leadhistory',
-                'leads_leadcallsummary'
+                'leads_leadcallsummary',
+                'branch_branch',
+                'branch_branchhistory',
+                'category_category',
+                'category_categoryhistory'
             ]
             
             # Tenant-specific tables that should NOT be copied from main DB
             # (they have different FK constraints or don't exist in main DB)
-            tenant_specific_tables = ['customer_customerhistory', 'leads_lead', 'leads_leadhistory', 'leads_leadcallsummary']
+            tenant_specific_tables = ['customer_customerhistory', 'leads_lead', 'leads_leadhistory', 'leads_leadcallsummary', 'branch_branch', 'branch_branchhistory', 'category_category', 'category_categoryhistory']
             
             # Create each required table
             for table_name in required_tables:
@@ -492,6 +496,215 @@ class Command(BaseCommand):
                                     pass
                         except Exception as fk_error:
                             self.stdout.write(f'Warning: Could not add leadcallsummary foreign keys: {fk_error}')
+                    elif table_name == 'branch_branch':
+                        # Create branch table with FKs to user_customuser (created_by)
+                        create_sql = """
+                            CREATE TABLE IF NOT EXISTS `branch_branch` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `name` varchar(255) NOT NULL,
+                                `code` varchar(50) NULL,
+                                `address` longtext NULL,
+                                `city` varchar(120) NULL,
+                                `state` varchar(120) NULL,
+                                `country` varchar(120) NULL,
+                                `zip_code` varchar(20) NULL,
+                                `phone` varchar(50) NULL,
+                                `email` varchar(254) NULL,
+                                `manager_name` varchar(255) NULL,
+                                `manager_email` varchar(254) NULL,
+                                `manager_phone` varchar(50) NULL,
+                                `is_active` tinyint(1) NOT NULL DEFAULT 1,
+                                `notes` longtext NULL,
+                                `created_by_id` bigint NULL,
+                                KEY `branch_bran_tenant__96dccc_idx` (`tenant_id`, `name`),
+                                KEY `branch_bran_tenant__93fa53_idx` (`tenant_id`, `code`),
+                                KEY `branch_bran_tenant__ee77c1_idx` (`tenant_id`, `city`),
+                                KEY `branch_bran_tenant__59a4f9_idx` (`tenant_id`, `is_active`),
+                                UNIQUE KEY `branch_unique_tenant_code` (`tenant_id`, `code`),
+                                CONSTRAINT `branch_created_by_fk` FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: branch_branch (explicit)')
+                    elif table_name == 'branch_branchhistory':
+                        # Drop table if it exists (might be partial/incomplete)
+                        try:
+                            cursor.execute("DROP TABLE IF EXISTS `branch_branchhistory`")
+                        except Exception:
+                            pass
+                        
+                        # Create branch history table first without foreign keys
+                        create_sql = """
+                            CREATE TABLE `branch_branchhistory` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `branch_id` char(32) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `changed_by_id` bigint NULL,
+                                `action` varchar(20) NOT NULL,
+                                `field_name` varchar(100) NULL,
+                                `old_value` longtext NULL,
+                                `new_value` longtext NULL,
+                                `changes` json NULL,
+                                `notes` longtext NULL,
+                                KEY `branch_bran_branch__360e6c_idx` (`branch_id`, `created_at`),
+                                KEY `branch_bran_tenant__4129a9_idx` (`tenant_id`, `created_at`),
+                                KEY `branch_bran_action_2bf3bc_idx` (`action`, `created_at`)
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: branch_branchhistory (explicit)')
+                        
+                        # Add foreign keys separately to avoid type mismatch errors
+                        try:
+                            # Check if branch_branch table exists
+                            cursor.execute("SHOW TABLES LIKE 'branch_branch'")
+                            if cursor.fetchone():
+                                # Drop existing constraint if it exists
+                                try:
+                                    cursor.execute("""
+                                        ALTER TABLE `branch_branchhistory`
+                                        DROP FOREIGN KEY `branchhistory_branch_fk`
+                                    """)
+                                except Exception:
+                                    pass  # Constraint doesn't exist, that's fine
+                                
+                                # Add foreign key to branch_branch
+                                cursor.execute("""
+                                    ALTER TABLE `branch_branchhistory`
+                                    ADD CONSTRAINT `branchhistory_branch_fk`
+                                    FOREIGN KEY (`branch_id`) REFERENCES `branch_branch` (`id`)
+                                    ON DELETE CASCADE ON UPDATE CASCADE
+                                """)
+                                self.stdout.write('Added foreign key: branchhistory_branch_fk')
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add branch foreign key: {fk_error}')
+                        
+                        try:
+                            # Drop existing constraint if it exists
+                            try:
+                                cursor.execute("""
+                                    ALTER TABLE `branch_branchhistory`
+                                    DROP FOREIGN KEY `branchhistory_changed_by_fk`
+                                """)
+                            except Exception:
+                                pass  # Constraint doesn't exist, that's fine
+                            
+                            # Add foreign key to user_customuser
+                            cursor.execute("""
+                                ALTER TABLE `branch_branchhistory`
+                                ADD CONSTRAINT `branchhistory_changed_by_fk`
+                                FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`)
+                                ON DELETE SET NULL ON UPDATE CASCADE
+                            """)
+                            self.stdout.write('Added foreign key: branchhistory_changed_by_fk')
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add changed_by foreign key: {fk_error}')
+                    elif table_name == 'category_category':
+                        # Create category table with FKs to user_customuser (created_by) and self (parent)
+                        create_sql = """
+                            CREATE TABLE IF NOT EXISTS `category_category` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `name` varchar(255) NOT NULL,
+                                `code` varchar(50) NULL,
+                                `description` longtext NULL,
+                                `parent_id` char(32) NULL,
+                                `is_active` tinyint(1) NOT NULL DEFAULT 1,
+                                `notes` longtext NULL,
+                                `created_by_id` bigint NULL,
+                                KEY `category_ca_tenant__2dcecb_idx` (`tenant_id`, `name`),
+                                KEY `category_ca_tenant__cdc2e3_idx` (`tenant_id`, `code`),
+                                KEY `category_ca_tenant__956d4c_idx` (`tenant_id`, `parent_id`),
+                                KEY `category_ca_tenant__c9a891_idx` (`tenant_id`, `is_active`),
+                                UNIQUE KEY `category_unique_tenant_code` (`tenant_id`, `code`),
+                                CONSTRAINT `category_created_by_fk` FOREIGN KEY (`created_by_id`) REFERENCES `user_customuser` (`id`) ON DELETE SET NULL ON UPDATE CASCADE,
+                                CONSTRAINT `category_parent_fk` FOREIGN KEY (`parent_id`) REFERENCES `category_category` (`id`) ON DELETE SET NULL ON UPDATE CASCADE
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: category_category (explicit)')
+                    elif table_name == 'category_categoryhistory':
+                        # Drop table if it exists (might be partial/incomplete)
+                        try:
+                            cursor.execute("DROP TABLE IF EXISTS `category_categoryhistory`")
+                        except Exception:
+                            pass
+                        
+                        # Create category history table first without foreign keys
+                        create_sql = """
+                            CREATE TABLE `category_categoryhistory` (
+                                `id` char(32) NOT NULL PRIMARY KEY,
+                                `created_at` datetime(6) NOT NULL,
+                                `updated_at` datetime(6) NOT NULL,
+                                `category_id` char(32) NOT NULL,
+                                `tenant_id` char(32) NOT NULL,
+                                `changed_by_id` bigint NULL,
+                                `action` varchar(20) NOT NULL,
+                                `field_name` varchar(100) NULL,
+                                `old_value` longtext NULL,
+                                `new_value` longtext NULL,
+                                `changes` json NULL,
+                                `notes` longtext NULL,
+                                KEY `category_ca_categor_360e6c_idx` (`category_id`, `created_at`),
+                                KEY `category_ca_tenant__4129a9_idx` (`tenant_id`, `created_at`),
+                                KEY `category_ca_action_2bf3bc_idx` (`action`, `created_at`)
+                            ) ENGINE=InnoDB;
+                        """
+                        cursor.execute(create_sql)
+                        self.stdout.write('Created table: category_categoryhistory (explicit)')
+                        
+                        # Add foreign keys separately to avoid type mismatch errors
+                        try:
+                            # Check if category_category table exists
+                            cursor.execute("SHOW TABLES LIKE 'category_category'")
+                            if cursor.fetchone():
+                                # Drop existing constraint if it exists
+                                try:
+                                    cursor.execute("""
+                                        ALTER TABLE `category_categoryhistory`
+                                        DROP FOREIGN KEY `categoryhistory_category_fk`
+                                    """)
+                                except Exception:
+                                    pass  # Constraint doesn't exist, that's fine
+                                
+                                # Add foreign key to category_category
+                                cursor.execute("""
+                                    ALTER TABLE `category_categoryhistory`
+                                    ADD CONSTRAINT `categoryhistory_category_fk`
+                                    FOREIGN KEY (`category_id`) REFERENCES `category_category` (`id`)
+                                    ON DELETE CASCADE ON UPDATE CASCADE
+                                """)
+                                self.stdout.write('Added foreign key: categoryhistory_category_fk')
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add category foreign key: {fk_error}')
+                        
+                        try:
+                            # Drop existing constraint if it exists
+                            try:
+                                cursor.execute("""
+                                    ALTER TABLE `category_categoryhistory`
+                                    DROP FOREIGN KEY `categoryhistory_changed_by_fk`
+                                """)
+                            except Exception:
+                                pass  # Constraint doesn't exist, that's fine
+                            
+                            # Add foreign key to user_customuser
+                            cursor.execute("""
+                                ALTER TABLE `category_categoryhistory`
+                                ADD CONSTRAINT `categoryhistory_changed_by_fk`
+                                FOREIGN KEY (`changed_by_id`) REFERENCES `user_customuser` (`id`)
+                                ON DELETE SET NULL ON UPDATE CASCADE
+                            """)
+                            self.stdout.write('Added foreign key: categoryhistory_changed_by_fk')
+                        except Exception as fk_error:
+                            self.stdout.write(f'Warning: Could not add changed_by foreign key: {fk_error}')
                     else:
                         self.stdout.write(f'Warning: Table {table_name} not found in main database')
             

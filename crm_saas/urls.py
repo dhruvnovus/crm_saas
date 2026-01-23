@@ -37,6 +37,7 @@ schema_view = get_schema_view(
         path('api/customers/', include('customer.urls')),
         path('api/leads/', include('leads.urls')),
         path('api/branches/', include('branch.urls')),
+        path('api/categories/', include('category.urls')),
     ],
 )
 
@@ -46,6 +47,7 @@ urlpatterns = [
     path('api/customers/', include('customer.urls')),
     path('api/leads/', include('leads.urls')),
     path('api/branches/', include('branch.urls')),
+    path('api/categories/', include('category.urls')),
     
     # API schema endpoint
     path('api/schema/', schema_view.without_ui(cache_timeout=0), name='schema-json'),

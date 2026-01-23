@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     'customer',
     'leads',
     'branch',
+    'category',
 ]
 
 MIDDLEWARE = [
